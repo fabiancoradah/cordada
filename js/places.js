@@ -160,35 +160,68 @@ export async function elevationAt(lat, lon) {
 
 // ---------- Punto de partida, glaciares y ruta ----------
 
+// Varios servidores públicos de Overpass: si uno está saturado, se usa otro.
+const OVERPASS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+];
 async function overpass(query) {
-  return getJSON('https://overpass-api.de/api/interpreter', { method: 'POST', body: `data=${encodeURIComponent(query)}` });
+  let last;
+  for (const url of OVERPASS) {
+    try {
+      const data = await getJSON(url, { method: 'POST', body: `data=${encodeURIComponent(query)}`, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+      // Overpass responde 200 con un "remark" cuando se le acaba el tiempo.
+      if (data.remark && /error|timed out/i.test(data.remark)) throw new Error(data.remark);
+      return data;
+    } catch (e) { last = e; }
+  }
+  throw last;
 }
 
-// Busca dónde se deja el auto: trailheads y estacionamientos, o el camino más cercano.
+const center = (e) => (e.type === 'node' ? { lat: e.lat, lon: e.lon } : e.center ? { lat: e.center.lat, lon: e.center.lon } : null);
+
+// Busca dónde se deja el auto (inicio de sendero, estacionamiento o el camino más
+// cercano), refugios y glaciares cerca de la cumbre.
 export async function surroundings(lat, lon) {
-  for (const r of [7000, 20000]) {
-    const q = `[out:json][timeout:25];
-      node(around:${r},${lat},${lon})[highway=trailhead]->.th;
-      node(around:${r},${lat},${lon})[amenity=parking]->.pk;
-      node(around:${r},${lat},${lon})[tourism~"^(alpine_hut|wilderness_hut)$"]->.hut;
-      way(around:${r},${lat},${lon})[highway~"^(primary|secondary|tertiary|unclassified)$"]->.rd;
-      node(w.rd)->.rn;
-      (way(around:3000,${lat},${lon})[natural=glacier];relation(around:3000,${lat},${lon})[natural=glacier];)->.gl;
-      .th out; .pk out; .hut out; .rn out skel; .gl out ids;`;
-    const data = await overpass(q);
-    const els = data.elements || [];
-    const glacier = els.some((e) => e.type !== 'node');
-    const huts = els.filter((e) => e.type === 'node' && e.tags?.tourism).map((e) => ({ lat: e.lat, lon: e.lon, name: e.tags.name || 'Refugio' }));
-    const summit = { lat, lon };
-    const cands = els.filter((e) => e.type === 'node' && !e.tags?.tourism).map((e) => {
-      const d = haversine(summit, e);
-      const w = e.tags?.highway === 'trailhead' ? 0.7 : e.tags?.amenity === 'parking' ? 0.85 : 1;
-      return { lat: e.lat, lon: e.lon, name: e.tags?.name || (e.tags?.highway === 'trailhead' ? 'Inicio de sendero' : e.tags?.amenity === 'parking' ? 'Estacionamiento' : 'Fin del camino'), score: d * w };
-    }).sort((a, b) => a.score - b.score);
-    if (cands.length) return { start: cands[0], glacier, huts };
-    if (r === 20000) return { start: null, glacier, huts };
+  const summit = { lat, lon };
+  const R = 25000;
+  // 1) Puntos de partida típicos: inicios de sendero, estacionamientos (también dibujados como áreas) y refugios.
+  const data = await overpass(`[out:json][timeout:40];
+    (nwr(around:${R},${lat},${lon})[highway=trailhead];
+     nwr(around:${R},${lat},${lon})[amenity=parking];
+     nwr(around:${R},${lat},${lon})[tourism~"^(alpine_hut|wilderness_hut)$"];
+     nwr(around:${R},${lat},${lon})[amenity=shelter][shelter_type!=public_transport];)->.p;
+    .p out center tags;
+    (way(around:3000,${lat},${lon})[natural=glacier];relation(around:3000,${lat},${lon})[natural=glacier];)->.gl;
+    .gl out ids;`);
+  const els = data.elements || [];
+  const glacier = els.some((e) => !e.tags && e.type !== 'node');
+  const huts = els.filter((e) => e.tags && (e.tags.tourism || e.tags.amenity === 'shelter'))
+    .map((e) => ({ ...center(e), name: e.tags.name || (e.tags.tourism ? 'Refugio' : 'Refugio / abrigo'), ele: e.tags.ele ? parseFloat(e.tags.ele) : null }))
+    .filter((h) => h.lat != null)
+    .sort((a, b) => haversine(summit, a) - haversine(summit, b));
+  const score = (p, w) => haversine(summit, p) * w;
+  let cands = els.filter((e) => e.tags && (e.tags.highway === 'trailhead' || e.tags.amenity === 'parking')).map((e) => {
+    const c = center(e);
+    const isTh = e.tags.highway === 'trailhead';
+    return c && { ...c, name: e.tags.name || (isTh ? 'Inicio de sendero' : 'Estacionamiento'), score: score(c, isTh ? 0.75 : 0.9) };
+  }).filter(Boolean);
+  // 2) Si no hay nada razonable, el punto más cercano de un camino.
+  if (!cands.length || Math.min(...cands.map((c) => c.score)) > 15000) {
+    for (const r of [8000, 20000]) {
+      try {
+        const roads = await overpass(`[out:json][timeout:40];
+          way(around:${r},${lat},${lon})[highway~"^(primary|secondary|tertiary|unclassified|track)$"][access!=private];
+          node(w);
+          out skel;`);
+        const nodes = (roads.elements || []).map((e) => ({ lat: e.lat, lon: e.lon, name: 'Fin del camino', score: score(e, 1) }));
+        if (nodes.length) { cands = cands.concat(nodes); break; }
+      } catch { /* sigue con lo que haya */ }
+    }
   }
-  return { start: null, glacier: false, huts: [] };
+  cands.sort((a, b) => a.score - b.score);
+  return { start: cands[0] || null, glacier, huts: huts.slice(0, 5) };
 }
 
 // Ruta a pie por senderos de OSM. Si no hay servicio, estima.
@@ -199,8 +232,11 @@ export async function hikingRoute(start, summit) {
     const f = gj.features?.[0];
     const pts = f.geometry.coordinates.map(([lo, la, ele]) => ({ lat: +la.toFixed(6), lon: +lo.toFixed(6), ele: ele == null ? null : Math.round(ele) }));
     // Si la ruta termina lejos de la cumbre, el sendero no llega: igual sirve como aproximación.
+    const gap = pts.length ? haversine(pts[pts.length - 1], summit) : Infinity;
+    // Si el sendero no llega a la cumbre, se completa el último tramo en línea recta.
+    if (gap >= 600) pts.push({ lat: summit.lat, lon: summit.lon, ele: summit.altitude ?? null });
     const stats = trackStats(pts);
-    return { source: 'brouter', pts, stats };
+    return { source: 'brouter', pts, stats, reachesSummit: gap < 600 };
   } catch {
     const [e1, e2] = await Promise.all([elevationAt(start.lat, start.lon).catch(() => null), summit.altitude ?? elevationAt(summit.lat, summit.lon).catch(() => null)]);
     const dist = haversine(start, summit) * 1.4;

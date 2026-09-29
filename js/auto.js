@@ -217,3 +217,96 @@ export function autoCars(trip) {
     car.passengerIds.push(r.id);
   }
 }
+
+// ---------- Recomendaciones ----------
+const hhmm = (mins) => `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(Math.round(mins % 60)).padStart(2, '0')}`;
+const toMin = (t) => { const [h, m] = t.slice(11, 16).split(':').map(Number); return h * 60 + m; };
+
+// Sugerencias automáticas a partir de la ruta, la altura y la luz del día.
+export function recommend(trip) {
+  const alt = trip.altitude || 0;
+  const s = trip.gpx?.stats;
+  const startEle = trip.gpx?.pts?.[0]?.ele ?? trip.gpx?.wpts?.[0]?.ele ?? null;
+  const up = s?.up || (startEle != null && alt ? Math.max(0, alt - startEle) : null);
+  const km = s?.distKm ?? null;
+  const upH = s?.hours ?? null; // ida
+  const downH = upH != null ? upH * 0.6 : null;
+  const out = { tips: [] };
+
+  // Días sugeridos: aclimatación y esfuerzo.
+  let days = 1;
+  const why = [];
+  if (alt >= 5000) { days = 3; why.push('sobre 5.000 m conviene dormir al menos dos noches en altura para aclimatar'); }
+  else if (alt >= 4000) { days = 2; why.push('sobre 4.000 m conviene dormir una noche en altura para aclimatar'); }
+  if (upH != null && upH + downH > 10 && days < 2) { days = 2; why.push(`son ~${Math.round(upH + downH)} h de marcha en total`); }
+  if (up != null && up > 1600 && days < 2) { days = 2; why.push(`${up.toLocaleString('es-CL')} m de desnivel es mucho para un día`); }
+  if (alt >= 5500 && days < 4) { days = 4; why.splice(0, 1, 'sobre 5.500 m se necesita una aclimatación más gradual'); }
+  out.days = days;
+  out.daysWhy = why;
+  const planned = tripDateList(trip).length || 1;
+  out.daysOk = planned >= days;
+
+  // Campamentos intermedios (subir ~800–1.000 m por día en altura).
+  if (days > 1 && up && startEle != null) {
+    const campDays = days - 1;
+    const perDay = up / (campDays + 1);
+    out.camps = Array.from({ length: campDays }, (_, i) => Math.round((startEle + perDay * (i + 1)) / 100) * 100);
+    const huts = (trip.info?.huts || []).filter((h) => h.ele);
+    const used = new Set();
+    out.camps = out.camps.map((c) => {
+      const hut = huts.filter((h) => !used.has(h) && Math.abs(h.ele - c) < 500 && h.ele < alt).sort((a, b) => Math.abs(a.ele - c) - Math.abs(b.ele - c))[0];
+      if (hut) used.add(hut);
+      return hut ? { ele: Math.round(hut.ele), name: hut.name } : { ele: c };
+    }).sort((a, b) => a.ele - b.ele);
+  }
+
+  // Horarios del día de cumbre según la luz.
+  const d = trip.weather?.daily?.daily;
+  const dates = tripDateList(trip);
+  const summitDay = dates[Math.min(dates.length - 1, Math.max(0, days - 1))] || dates[0];
+  const di = d ? d.time.indexOf(summitDay) : -1;
+  const sunrise = di >= 0 ? toMin(d.sunrise[di]) : 7 * 60;
+  const sunset = di >= 0 ? toMin(d.sunset[di]) : 19 * 60 + 30;
+  const campUp = out.camps?.length ? Math.max(0, alt - out.camps[out.camps.length - 1].ele) : up;
+  // En altura se avanza más lento de lo que dice Naismith.
+  const altFactor = alt >= 5000 ? 1.8 : alt >= 4000 ? 1.4 : alt >= 3000 ? 1.15 : 1;
+  const climbH = upH != null ? (days > 1 && up ? upH * (campUp / up) : upH) * altFactor : null;
+  const descH = climbH != null ? climbH * 0.6 : null;
+  if (climbH != null) {
+    const start = alt >= 4000 ? sunrise - 90 : sunrise - 30; // en altura se parte de noche
+    out.start = hhmm(Math.max(3 * 60, start));
+    // Límite de cumbre: bajar con luz y margen de 1 h; en alta montaña no después de las 14:00 (viento y tormentas de tarde).
+    const byLight = sunset - descH * 60 - 60;
+    const cap = alt >= 3500 ? 14 * 60 : 15 * 60;
+    out.turnaround = hhmm(Math.min(byLight, cap));
+    out.summitEta = hhmm(Math.max(3 * 60, start) + climbH * 60 * 1.25); // +25 % por descansos
+    out.late = Math.max(3 * 60, start) + climbH * 60 * 1.25 > Math.min(byLight, cap);
+  }
+
+  // Agua y comida por persona.
+  const effortH = upH != null ? upH + downH : null;
+  const perDayH = effortH != null ? effortH / days : null;
+  out.water = perDayH != null ? Math.min(5, Math.max(1.5, Math.round((perDayH * 0.5 + (alt >= 3500 ? 1 : 0)) * 2) / 2)) : (alt >= 3500 ? 3 : 2);
+  out.kcal = alt >= 3500 ? '4.000–5.000' : '2.500–3.500';
+
+  // Dificultad física (esfuerzo) aproximada.
+  if (km != null && up != null) {
+    const effort = km * 2 + up / 100;
+    out.effort = effort < 15 ? 'Baja' : effort < 30 ? 'Media' : effort < 45 ? 'Alta' : 'Muy alta';
+  }
+
+  // Equipo clave según el tipo de salida.
+  const mods = trip.modules || [];
+  const key = [];
+  if (mods.includes('alpine') || mods.includes('winter')) key.push('crampones', 'piolet', 'casco');
+  if (mods.includes('glacier')) key.push('cuerda y equipo de rescate en grieta');
+  if (mods.includes('ski') || (mods.includes('winter') && alt < 4000)) key.push('ARVA, pala y sonda');
+  if (alt >= 3500) key.push('lentes cat. 4', 'ropa de pluma');
+  if (mods.includes('camp')) key.push('carpa de 4 estaciones', 'saco −5 °C o menos');
+  out.keyGear = [...new Set(key)];
+
+  if (alt >= 3000) out.tips.push('Mal de altura: sube lento, hidrátate y, si hay dolor de cabeza fuerte, vómitos o confusión, baja de inmediato.');
+  if (alt >= 3500) out.tips.push('En la cordillera central el viento y las tormentas aumentan en la tarde: cumbre temprano.');
+  if (mods.includes('glacier')) out.tips.push('Hay glaciares cerca: encordarse al cruzarlos y conocer rescate en grieta.');
+  return out;
+}

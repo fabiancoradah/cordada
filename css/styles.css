@@ -349,3 +349,9 @@ label.check { display: flex; align-items: center; gap: 8px; color: var(--text); 
 .gear-check input { width: 26px; height: 26px; }
 .highlight { border-color: color-mix(in srgb, var(--series-1) 45%, var(--border)); }
 .members .progress { max-width: 220px; }
+.reco { display: grid; gap: 8px; margin: 8px 0 0; }
+.reco div { display: grid; grid-template-columns: minmax(110px, 34%) minmax(0, 1fr); gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+.reco div:first-child { border-top: 0; }
+.reco dt { color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
+.reco dd { margin: 0; }
+.alert .btn.small { margin-left: 6px; }

@@ -3,7 +3,7 @@ import { CATEGORIES, MODULES, SCOPES, gearProgress, weightByMember, ropesOf, rop
 import { MODELS, fetchWeather, series, hourlyTimes, wmo, assess, externalLinks, lineChart, wireCharts } from './weather.js';
 import { createMap, parseGPX, drawTrack, profileChart, wireProfile, toDMS } from './map.js';
 import { searchPlaces, placeDetails, surroundings, hikingRoute } from './places.js';
-import { AUTO_MODULES, MANUAL_MODULES, detect, activeModules, syncGear, autoOrganize } from './auto.js';
+import { AUTO_MODULES, MANUAL_MODULES, detect, activeModules, syncGear, autoOrganize, recommend } from './auto.js';
 import * as drive from './drive.js';
 import { TripSync } from './sync.js';
 import { FIREBASE_CONFIG, DRIVE_CLIENT_ID } from './config.js';
@@ -325,9 +325,11 @@ async function enrich(trip, { force = false } = {}) {
           if (!trip.altitude && d.altitude) { trip.altitude = d.altitude; trip.info.altitudeEstimated = !!d.altitudeEstimated; }
         }).catch(() => {}));
       }
-      if (force || !trip.info.surroundAt) {
+      // v2: búsqueda más completa; reintenta si antes no encontró punto de partida.
+      const retry = !trip.info.start && Date.now() - (trip.info.surroundAt || trip.info.surroundErr || 0) > 10 * 60e3;
+      if (force || trip.info.surroundV !== 2 || retry) {
         tasks.push(surroundings(trip.lat, trip.lon).then(async (s) => {
-          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now() });
+          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 2, surroundErr: null });
           if (s.start && (!trip.gpx || trip.gpx.auto)) {
             const r = await hikingRoute(s.start, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude });
             trip.gpx = {
@@ -337,9 +339,10 @@ async function enrich(trip, { force = false } = {}) {
               pts: r.pts,
               wpts: [{ lat: s.start.lat, lon: s.start.lon, ele: r.pts[0]?.ele ?? null, name: s.start.name }, { lat: trip.lat, lon: trip.lon, ele: trip.altitude, name: trip.peak }],
               stats: r.stats,
+              reachesSummit: r.reachesSummit,
             };
           }
-        }).catch(() => {}));
+        }).catch((e) => { console.warn('Punto de partida', e); trip.info.surroundErr = Date.now(); }));
       }
     }
     await Promise.all(tasks);
@@ -430,8 +433,9 @@ function tabInfo(trip, el) {
       <div><dt>Tiempo (ida)</dt><dd>${s ? hm(s.hours) : '…'}</dd></div>
       ${d && dates[0] && d.time.includes(dates[0]) ? `<div><dt>Luz del día</dt><dd>${fmtHour(d.sunrise[d.time.indexOf(dates[0])])}–${fmtHour(d.sunset[d.time.indexOf(dates[0])])}</dd></div>` : ''}
     </dl>
-    <p class="small muted">${!trip.info?.surroundAt ? 'Calculando punto de partida y ruta…'
-      : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? 'Ruta calculada sobre senderos de OpenStreetMap desde el punto de partida más cercano. Revísala en el Mapa: puede no ser la ruta normal.' : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
+    <p class="small muted">${!trip.info?.surroundAt && trip.info?.surroundErr ? 'No se pudo consultar OpenStreetMap en este momento. Se vuelve a intentar solo al abrir la salida.'
+      : !trip.info?.surroundAt || trip.info?.surroundV !== 2 ? 'Buscando punto de partida y calculando la ruta…'
+      : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? `Ruta calculada sobre senderos de OpenStreetMap desde ${esc(start?.name || 'el punto de partida más cercano')}${trip.gpx.reachesSummit === false ? ' (el último tramo a la cumbre, en línea recta)' : ''}. Revísala en el Mapa: puede no ser la ruta normal.` : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
       : trip.gpx ? `Track cargado: ${esc(trip.gpx.name || '')}.` : 'No se encontró un camino cercano: carga el track GPX en el Mapa.'}
       Tiempo según Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos.</p>
     <div class="link-list top-gap">
@@ -443,6 +447,8 @@ function tabInfo(trip, el) {
     ${trip.info?.huts?.length ? `<p class="small top-gap">🛖 Refugios cerca: ${trip.info.huts.map((h) => esc(h.name)).join(', ')}</p>` : ''}
     ${owner ? `<form id="ah-form" class="row gap top-gap"><input name="url" type="url" class="grow" placeholder="Pega el link de la ruta en Andeshandbook (opcional)" value="${esc(trip.andesUrl || '')}"><button class="btn small" type="submit">Guardar</button></form>` : ''}
   </section>
+
+  ${recoCard(trip, owner)}
 
   <section class="card">
     <div class="row between"><h3>Clima en la cumbre</h3><a href="#/salida/${trip.id}/clima">Detalle →</a></div>
@@ -488,6 +494,16 @@ function tabInfo(trip, el) {
   </section>`;
 
   $('#invite', el)?.addEventListener('click', () => invite(trip));
+  $('#fit-days', el)?.addEventListener('click', () => {
+    const rec = recommend(trip);
+    const [y, m, dd] = trip.date.split('-').map(Number);
+    trip.endDate = new Date(y, m - 1, dd + rec.days - 1).toLocaleDateString('sv-SE');
+    delete trip.weather;
+    syncGear(trip);
+    save();
+    renderTrip(trip, 'salida');
+    toast(`Salida de ${rec.days} días`);
+  });
   $('#rsvp-yes', el)?.addEventListener('click', () => joinTrip(trip, 'si', el));
   $('#rsvp-no', el)?.addEventListener('click', () => joinTrip(trip, 'no', el));
   $('#rsvp-toggle', el)?.addEventListener('click', () => {
@@ -538,6 +554,27 @@ function tabInfo(trip, el) {
     deleteTrip(trip.id);
     go('#/');
   });
+}
+
+function recoCard(trip, owner) {
+  const r = recommend(trip);
+  const dates = tripDates(trip);
+  const rows = [
+    ['Días sugeridos', `${r.days} ${r.days === 1 ? 'día' : 'días'}${r.daysWhy.length ? ` · ${r.daysWhy.join('; ')}` : ''}`],
+    r.camps?.length && ['Campamentos', r.camps.map((c) => (c.name ? `${esc(c.name)} (~${c.ele.toLocaleString('es-CL')} m)` : `~${c.ele.toLocaleString('es-CL')} m`)).join(' → ')],
+    r.start && ['Día de cumbre', `salir ${r.start} · cumbre aprox. ${r.summitEta} · <b>hora límite ${r.turnaround}</b>`],
+    r.effort && ['Exigencia física', r.effort],
+    ['Agua por persona', `${String(r.water).replace('.', ',')} L por día de marcha · ${r.kcal} kcal/día`],
+    r.keyGear.length && ['Equipo clave', r.keyGear.join(', ')],
+  ].filter(Boolean);
+  return `<section class="card">
+    <h3>Recomendaciones</h3>
+    ${!r.daysOk ? `<p class="alert warn">⚠️ La salida dura ${dates.length} ${dates.length === 1 ? 'día' : 'días'} y se recomiendan ${r.days}.${owner ? ' <button class="btn small" id="fit-days">Ajustar a ' + r.days + ' días</button>' : ''}</p>` : ''}
+    ${r.late ? '<p class="alert warn">⚠️ Con el tiempo estimado se llegaría a la cumbre después de la hora límite: consideren un campamento más alto o partir antes.</p>' : ''}
+    <dl class="reco">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>
+    ${r.tips.length ? `<ul class="reasons small">${r.tips.map((t) => `<li>💡 ${esc(t)}</li>`).join('')}</ul>` : ''}
+    <p class="small muted">Sugerencias calculadas con la altura, la ruta y la luz del día. Ajusten según la experiencia del grupo y la reseña de la ruta.</p>
+  </section>`;
 }
 
 const andesSearch = (q) => `https://www.google.com/search?q=${encodeURIComponent(`site:andeshandbook.org ${q}`)}`;
@@ -1236,6 +1273,8 @@ function planText(trip) {
 function tabPlan(trip, el) {
   const p = trip.plan;
   const o = trip.org;
+  const rec = recommend(trip);
+  if (!p.turnaround && rec.turnaround) p.turnaround = rec.turnaround;
   // Datos del club por defecto (Mi ficha → Club).
   Object.entries(state.settings.club || {}).forEach(([k, v]) => { if (!o[k] && v) o[k] = v; });
   const field = (obj, group) => ([k, label, type, ph]) => (type === 'textarea'
