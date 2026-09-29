@@ -1,5 +1,5 @@
 // Service worker: la app funciona sin señal en la montaña.
-const VERSION = 'cordada-v11';
+const VERSION = 'cordada-v12';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'manifest.webmanifest', 'icons/icon.svg',
   'js/app.js', 'js/store.js', 'js/gear.js', 'js/weather.js', 'js/map.js', 'js/drive.js', 'js/sync.js', 'js/config.js', 'js/places.js', 'js/auto.js',
@@ -11,7 +11,7 @@ const TILE_HOSTS = /tile\.opentopomap\.org|tile\.openstreetmap\.org|server\.arcg
 const MAX_TILES = 3000;
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {
@@ -42,10 +42,11 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // Archivos de la app: red primero, caché si no hay señal.
+  // Archivos de la app: red primero (sin la caché HTTP de GitHub Pages,
+  // para que una versión nueva llegue al tiro), caché si no hay señal.
   if (url.origin === self.location.origin) {
     e.respondWith(
-      fetch(request)
+      fetch(request.url, { cache: 'no-cache', credentials: 'same-origin' })
         .then((res) => {
           if (res.ok) {
             const copy = res.clone();

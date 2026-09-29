@@ -1661,5 +1661,18 @@ window.addEventListener('online', () => document.body.classList.remove('offline'
 window.addEventListener('offline', () => document.body.classList.add('offline'));
 if (!navigator.onLine) document.body.classList.add('offline');
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Busca versiones nuevas sin la caché HTTP y recarga una vez cuando la nueva toma el control.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    if (!document.activeElement?.matches?.('input, textarea')) location.reload();
+  });
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+    .then((reg) => {
+      reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+    })
+    .catch(() => {});
 }
