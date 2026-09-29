@@ -174,7 +174,7 @@ function installCard() {
     body = `<ol class="ios-steps">
       <li>Toca <b>Compartir</b> ${SHARE_ICON} en la barra de Safari (abajo o arriba).</li>
       <li>Baja y elige <b>"Agregar a inicio"</b> ${ADD_ICON} y luego <b>Agregar</b>.</li>
-      <li>Abre <b>Cordada</b> desde tu pantalla de inicio. Si te invitaron a una salida, toca <b>"Abrir invitación"</b> y pega el link de WhatsApp.</li>
+      <li>Abre <b>Cordada</b> desde tu pantalla de inicio.</li>
     </ol>`;
   } else if (installEvent) {
     body = '<p>Queda con su ícono, se abre en pantalla completa y funciona sin señal en la montaña.</p><button class="btn primary" id="do-install">Instalar</button>';
@@ -210,7 +210,9 @@ function openInviteText(text) {
   return false;
 }
 
+// Solo hace falta en la app instalada en iPhone: ahí los links de WhatsApp abren Safari.
 function openInviteCard() {
+  if (!(isIOS && isStandalone())) return '';
   return `<section class="card open-invite">
     <h3>¿Te invitaron a una salida?</h3>
     <p class="small muted">Pega aquí el link que te llegó por WhatsApp.</p>
