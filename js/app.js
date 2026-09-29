@@ -370,9 +370,9 @@ async function enrich(trip, { force = false } = {}) {
       }
       // v3: compara varios puntos de partida; reintenta si antes no encontró ninguno.
       const retry = !trip.info.start && Date.now() - (trip.info.surroundAt || trip.info.surroundErr || 0) > 10 * 60e3;
-      if (force || trip.info.surroundV !== 4 || retry) {
+      if (force || trip.info.surroundV !== 5 || retry) {
         tasks.push(surroundings(trip.lat, trip.lon).then(async (s) => {
-          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 4, surroundErr: null });
+          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 5, surroundErr: null });
           if (trip.info.startManual) { trip.info.start = trip.info.startManual; return; }
           const r = (!trip.gpx || trip.gpx.auto) ? await bestRoute(s.cands, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude }) : null;
           if (r) {
@@ -508,7 +508,7 @@ function tabInfo(trip, el) {
       ${d && dates[0] && d.time.includes(dates[0]) ? `<div><dt>Luz del día</dt><dd>${fmtHour(d.sunrise[d.time.indexOf(dates[0])])}–${fmtHour(d.sunset[d.time.indexOf(dates[0])])}</dd></div>` : ''}
     </dl>
     <p class="small muted">${!trip.info?.surroundAt && trip.info?.surroundErr ? 'No se pudo consultar OpenStreetMap en este momento. Se vuelve a intentar solo al abrir la salida.'
-      : !trip.info?.surroundAt || trip.info?.surroundV !== 4 ? 'Buscando punto de partida y calculando la ruta…'
+      : !trip.info?.surroundAt || trip.info?.surroundV !== 5 ? 'Buscando punto de partida y calculando la ruta…'
       : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? `Ruta calculada sobre senderos de OpenStreetMap desde ${esc(start?.name || 'el punto de partida más cercano')}${trip.gpx.reachesSummit === false ? ' (el último tramo a la cumbre, en línea recta)' : ''}. Revísala en el Mapa: puede no ser la ruta normal.` : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
       : trip.gpx ? `Track cargado: ${esc(trip.gpx.name || '')}.` : 'No se encontró un camino cercano: carga el track GPX en el Mapa.'}
       Tiempo según Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos.</p>

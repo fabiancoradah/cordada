@@ -250,21 +250,24 @@ export async function bestRoute(cands, summit) {
   const picks = [];
   for (const c of scored) {
     if (picks.every((p) => haversine(p, c) > 1500)) picks.push(c);
-    if (picks.length === 4) break;
+    if (picks.length === 5) break;
   }
   // De a una: el servidor público de rutas rechaza consultas simultáneas.
   const routes = [];
   for (const c of picks) {
-    routes.push(await hikingRoute(c, summit).then((r) => ({ start: c, ...r })).catch(() => null));
+    let r = await hikingRoute(c, summit).catch(() => null);
+    // Sin sendero, o con un rodeo absurdo (más de 2,5 veces la línea recta): se estima igual
+    // en vez de descartar el punto; muchas rutas normales no están completas en OpenStreetMap.
+    if (!r || (r.source === 'brouter' && r.stats.distKm > (haversine(c, summit) / 1000) * 2.5 + 2)) r = await estimateRoute(c, summit).catch(() => null);
+    if (r) routes.push({ start: c, ...r });
   }
-  const ok = routes.filter((r) => r && r.source === 'brouter'
-    // Descarta rodeos absurdos (más de 3 veces la distancia en línea recta).
-    && r.stats.distKm <= (haversine(r.start, summit) / 1000) * 3 + 2);
-  const best = (ok.length ? ok : routes.filter(Boolean)).sort((a, b) => a.stats.hours - b.stats.hours)[0];
+  // Se compara por tiempo; la estimación en línea recta se castiga un poco por ser optimista.
+  const cost = (r) => r.stats.hours * (r.source === 'estimate' ? 1.2 : 1);
+  const best = [...routes].sort((a, b) => cost(a) - cost(b))[0];
   if (!best) return null;
   if (best.pts[0] && best.start.ele != null && best.pts[0].ele == null) best.pts[0].ele = best.start.ele;
   // Alternativas evaluadas, para que el encargado pueda elegir otra.
-  best.options = routes.filter(Boolean).map((r) => ({
+  best.options = routes.map((r) => ({
     lat: r.start.lat, lon: r.start.lon, name: r.start.name, ele: r.start.ele ?? r.pts[0]?.ele ?? null,
     distKm: +r.stats.distKm.toFixed(1), hours: +r.stats.hours.toFixed(2), source: r.source,
   }));
@@ -285,13 +288,21 @@ export async function hikingRoute(start, summit) {
     const stats = trackStats(pts);
     return { source: 'brouter', pts, stats, reachesSummit: gap < 600 };
   } catch {
-    const [e1, e2] = await Promise.all([elevationAt(start.lat, start.lon).catch(() => null), summit.altitude ?? elevationAt(summit.lat, summit.lon).catch(() => null)]);
-    const dist = haversine(start, summit) * 1.4;
-    const up = e1 != null && e2 != null ? Math.max(0, e2 - e1) : null;
-    return {
-      source: 'estimate',
-      pts: [{ ...start, ele: e1 }, { lat: summit.lat, lon: summit.lon, ele: e2 }],
-      stats: { distKm: dist / 1000, up: up ?? 0, down: 0, maxEle: e2, minEle: e1, hours: dist / 1000 / 4 + (up || 0) / 600, profile: [] },
-    };
+    return estimateRoute(start, summit);
   }
+}
+
+// Estimación sin senderos: línea recta × 1,4 y subida neta.
+export async function estimateRoute(start, summit) {
+  const [e1, e2] = await Promise.all([
+    start.ele ?? elevationAt(start.lat, start.lon).catch(() => null),
+    summit.altitude ?? elevationAt(summit.lat, summit.lon).catch(() => null),
+  ]);
+  const dist = haversine(start, summit) * 1.4;
+  const up = e1 != null && e2 != null ? Math.max(0, e2 - e1) : null;
+  return {
+    source: 'estimate',
+    pts: [{ lat: start.lat, lon: start.lon, ele: e1 }, { lat: summit.lat, lon: summit.lon, ele: e2 }],
+    stats: { distKm: dist / 1000, up: up ?? 0, down: 0, maxEle: e2, minEle: e1, hours: dist / 1000 / 4 + (up || 0) / 600, profile: [] },
+  };
 }
