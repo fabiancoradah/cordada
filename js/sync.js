@@ -8,6 +8,7 @@
 
 export const LISTS = ['gear', 'members', 'ropes', 'cars', 'itinerary'];
 const LOCAL_ONLY = ['weather', 'syncId', 'createdAt'];
+// Nota: `info` (foto, punto de partida, glaciares) y `gpx` sí se comparten.
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 

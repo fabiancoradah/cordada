@@ -217,19 +217,21 @@ export const ropeOfMember = (trip, memberId) => ropesOf(trip).find((r) => r.memb
 export function gearProgress(trip, memberId = null) {
   let total = 0;
   let done = 0;
-  const members = trip.members.length ? trip.members : [{ id: '_' }];
+  const going = trip.members.filter((m) => m.rsvp !== 'no');
+  const members = memberId ? trip.members.filter((m) => m.id === memberId) : (going.length ? going : [{ id: '_' }]);
+  const ropes = ropesOf(trip);
   for (const g of trip.gear) {
-    if (g.scope === 'c') {
-      for (const r of ropesOf(trip)) {
-        if (memberId && !r.memberIds.includes(memberId)) continue;
-        total++;
-        if (g.checks?.[ropeKey(r)]) done++;
-      }
-    } else if (g.scope === 'p') {
+    if (g.scope === 'p') {
       for (const m of members) {
-        if (memberId && m.id !== memberId) continue;
+        if (g.owner && g.owner !== m.id) continue;
         total++;
         if (g.checks?.[m.id]) done++;
+      }
+    } else if (g.scope === 'c') {
+      for (const r of ropes) {
+        if (memberId && !(r.memberIds.includes(memberId) && (!g.carriers?.[r.id] || g.carriers[r.id] === memberId))) continue;
+        total++;
+        if (g.checks?.[ropeKey(r)]) done++;
       }
     } else {
       if (memberId && g.assignee !== memberId) continue;
@@ -240,17 +242,18 @@ export function gearProgress(trip, memberId = null) {
   return { total, done, pct: total ? Math.round((done / total) * 100) : 0 };
 }
 
-// Peso estimado que carga cada integrante (personal + grupal asignado).
+// Peso estimado que carga cada integrante (personal + lo que le toca del grupo).
 export function weightByMember(trip) {
   const out = {};
   for (const m of trip.members) out[m.id] = 0;
   for (const g of trip.gear) {
     const w = Number(g.weight) || 0;
     if (g.scope === 'p') {
-      for (const m of trip.members) out[m.id] += w;
+      for (const m of trip.members) if (!g.owner || g.owner === m.id) out[m.id] += w;
     } else if (g.scope === 'c') {
-      // Se reparte entre los integrantes de cada cordada.
       for (const r of ropesOf(trip)) {
+        const who = g.carriers?.[r.id];
+        if (who && out[who] != null) { out[who] += w; continue; }
         const ids = r.memberIds.filter((id) => out[id] != null);
         ids.forEach((id) => { out[id] += w / ids.length; });
       }

@@ -309,3 +309,43 @@ body.offline .offline-banner { display: block; }
 label.check { display: flex; align-items: center; gap: 8px; color: var(--text); }
 .mchk.rope { border-radius: 8px; width: auto; min-width: 36px; padding: 0 6px; }
 .sync-dot { font-size: .9rem; cursor: default; }
+
+/* ---------- Flujo automático (v3) ---------- */
+.brand-mark { width: 30px; height: 30px; border-radius: 8px; }
+.btn.big { min-height: 54px; font-size: 1.05rem; width: 100%; }
+.callout { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.quiet { box-shadow: none; background: transparent; }
+.center { text-align: center; }
+.steps { padding-left: 1.2rem; margin: 0; display: grid; gap: 10px; }
+
+.trip-card { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 12px; align-items: start; }
+.trip-thumb { width: 84px; height: 84px; border-radius: 10px; background: var(--surface-2) center / cover no-repeat; display: grid; place-items: center; font-size: 2rem; }
+.trip-body { min-width: 0; }
+
+.hero-card {
+  position: relative; border-radius: var(--radius); overflow: hidden; color: #fff; min-height: 220px;
+  display: flex; align-items: flex-end;
+  background: linear-gradient(180deg, rgb(0 0 0 / 5%), rgb(0 0 0 / 70%)), var(--photo, linear-gradient(135deg, #3b5568, #1d2a36));
+  background-size: cover; background-position: center;
+}
+.hero-inner { padding: 18px; display: grid; gap: 2px; text-shadow: 0 1px 3px rgb(0 0 0 / 50%); }
+.hero-inner h2 { font-size: 1.7rem; margin: 0; }
+.hero-inner p { margin: 0; }
+.hero-inner a { color: #fff; }
+.hero-card .eyebrow { color: #ffd2b8; }
+
+.results button { display: flex; gap: 10px; align-items: center; }
+.kind { font-size: 1.4rem; flex: none; }
+.picked { display: flex; gap: 10px; align-items: center; padding: 10px 12px; margin-top: 10px; border-radius: 10px; background: var(--surface-2); }
+.chip.toggle { font: inherit; background: var(--surface); color: var(--text-2); }
+.chip.toggle.on, .chip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface)); color: var(--text); }
+.chip .auto { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-left: 4px; }
+.reasons { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 4px; }
+.desc { line-height: 1.55; max-width: 65ch; }
+.days.compact .day { cursor: default; }
+.invite .btn { min-height: 48px; }
+
+.gear-check { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; color: var(--text); font-weight: 400; font-size: 1rem; cursor: pointer; padding: 4px 0; }
+.gear-check input { width: 26px; height: 26px; }
+.highlight { border-color: color-mix(in srgb, var(--series-1) 45%, var(--border)); }
+.members .progress { max-width: 220px; }

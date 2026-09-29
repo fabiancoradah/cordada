@@ -16,7 +16,7 @@ function load() {
 // Completa campos agregados en versiones posteriores.
 export function normalize(t) {
   ['members', 'gear', 'ropes', 'cars', 'itinerary', 'modules'].forEach((k) => { if (!Array.isArray(t[k])) t[k] = []; });
-  ['plan', 'org', 'drive'].forEach((k) => { if (!t[k] || typeof t[k] !== 'object') t[k] = {}; });
+  ['plan', 'org', 'drive', 'overrides', 'info'].forEach((k) => { if (!t[k] || typeof t[k] !== 'object') t[k] = {}; });
   return t;
 }
 
@@ -66,6 +66,9 @@ export function newTrip(fields) {
     ropes: [],
     cars: [],
     itinerary: [],
+    overrides: {},
+    info: {},
+    ownerId: null,
     plan: {},
     org: { ...(state.settings.club || {}) },
     gpx: null,

@@ -1,16 +1,18 @@
 import { state, save, saveLocal, hooks, uid, longId, normalize, getTrip, newTrip, deleteTrip, encodeTrip, decodeTrip, importTrip } from './store.js';
-import { CATEGORIES, MODULES, makeItem, addModules, gearProgress, weightByMember, ropesOf, ropeKey } from './gear.js';
+import { CATEGORIES, MODULES, SCOPES, gearProgress, weightByMember, ropesOf, ropeKey, ropeOfMember } from './gear.js';
 import { MODELS, fetchWeather, series, hourlyTimes, wmo, assess, externalLinks, lineChart, wireCharts } from './weather.js';
-import { createMap, parseGPX, drawTrack, profileChart, wireProfile, toDMS, geocode } from './map.js';
+import { createMap, parseGPX, drawTrack, profileChart, wireProfile, toDMS } from './map.js';
+import { searchPlaces, placeDetails, surroundings, hikingRoute } from './places.js';
+import { AUTO_MODULES, MANUAL_MODULES, detect, activeModules, syncGear, autoOrganize } from './auto.js';
 import * as drive from './drive.js';
 import { TripSync } from './sync.js';
-import { FIREBASE_CONFIG } from './config.js';
+import { FIREBASE_CONFIG, DRIVE_CLIENT_ID } from './config.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const view = $('#view');
-const ui = { day: null, filter: 'all', mapCtrl: null, localPhotos: [] };
+const ui = { day: null, mapCtrl: null, draft: null };
 
 // ---------- Fechas ----------
 const parseDay = (s) => {
@@ -61,15 +63,49 @@ const kg = (g) => `${(g / 1000).toLocaleString('es-CL', { maximumFractionDigits:
 const me = (trip) => state.settings.me?.[trip.id] || '';
 const ropeLabel = (r) => (/^cordada\s*(\d+)$/i.test(r.name.trim()) ? `C${r.name.trim().match(/\d+/)[0]}` : initials(r.name));
 
+// ---------- Identidad: mi ficha, encargado ----------
+const profile = () => state.settings.profile || null;
+const isOwner = (trip) => !!trip.ownerId && me(trip) === trip.ownerId;
+const myMember = (trip) => trip.members.find((m) => m.id === me(trip));
+const ownerOf = (trip) => trip.members.find((m) => m.id === trip.ownerId);
+// Quién puede recalcular datos compartidos (evita que todos los teléfonos escriban a la vez).
+const canAuto = (trip) => isOwner(trip) || !trip.syncId;
+const setMe = (trip, id) => { state.settings.me = { ...(state.settings.me || {}), [trip.id]: id }; };
+
+const FICHA_FIELDS = [
+  ['name', 'Nombre y apellido', 'text', '', true],
+  ['phone', 'Teléfono (WhatsApp)', 'tel', '+56 9 ...', true],
+  ['emergencyName', 'Contacto de emergencia', 'text', 'Nombre', true],
+  ['emergencyPhone', 'Teléfono del contacto', 'tel', '', true],
+  ['rut', 'RUT', 'text', '12.345.678-9'],
+  ['age', 'Edad', 'number', ''],
+  ['health', 'Salud (alergias, medicamentos, grupo sanguíneo)', 'text', ''],
+  ['carFrom', 'Comuna o punto desde donde sales', 'text', 'Ej: Ñuñoa'],
+];
+const FIRST_AID = ['', 'WFR', 'WAFA', 'Primeros auxilios básicos', 'Profesional de salud'];
+
+function fichaForm(p = {}, { compact = false } = {}) {
+  const fields = compact ? FICHA_FIELDS.filter((f) => f[4]) : FICHA_FIELDS;
+  return `<div class="cols2">${fields.map(([k, label, type, ph, req]) => `<label>${label}<input name="f_${k}" type="${type}" value="${esc(p[k] ?? '')}" placeholder="${esc(ph)}" ${req ? 'required' : ''}></label>`).join('')}
+    ${compact ? '' : `<label>Primeros auxilios<select name="f_firstAid">${FIRST_AID.map((x) => `<option value="${esc(x)}" ${p.firstAid === x ? 'selected' : ''}>${esc(x || 'Sin certificación')}</option>`).join('')}</select></label>
+    <label>¿Llevas auto? Cupos para pasajeros<input name="f_carSeats" type="number" min="0" max="8" value="${esc(p.carSeats ?? 0)}"></label>`}
+  </div>`;
+}
+function readFicha(form) {
+  const out = { ...(profile() || {}) };
+  for (const el of form.querySelectorAll('[name^="f_"]')) out[el.name.slice(2)] = el.type === 'number' ? (el.value === '' ? '' : Number(el.value)) : el.value.trim();
+  return out;
+}
+const memberFromProfile = (p) => ({ id: uid(), name: p.name, phone: p.phone, emergencyName: p.emergencyName, emergencyPhone: p.emergencyPhone, rut: p.rut || '', age: p.age || '', health: p.health || '', firstAid: p.firstAid || '', carSeats: p.carSeats || 0, carFrom: p.carFrom || '' });
+
 // ---------- Router ----------
 const TABS = [
-  ['resumen', 'Resumen'],
+  ['salida', 'Salida'],
+  ['equipo', 'Mi equipo'],
   ['grupo', 'Grupo'],
-  ['equipo', 'Equipo'],
   ['clima', 'Clima'],
   ['mapa', 'Mapa'],
-  ['fotos', 'Fotos'],
-  ['plan', 'Plan y seguridad'],
+  ['aviso', 'Aviso', 'owner'],
 ];
 
 function destroyMap() {
@@ -84,16 +120,16 @@ function route() {
   destroyMap();
   window.scrollTo(0, 0);
   const [r, id, tab] = parts;
-  if (r === 'nueva') return renderForm(null);
-  if (r === 'ajustes') return renderSettings();
+  if (r === 'nueva') return renderCreate();
+  if (r === 'ajustes' || r === 'ficha') return renderSettings();
   if (r === 'importar') return renderImport(parts.slice(1).join('/'));
   if (r === 'unirse') return renderJoin(id);
+  if (r === 'respuesta') return renderReply(parts.slice(1).join('/'));
   if (r === 'salida') {
     const trip = getTrip(id);
     if (!trip) return go('#/');
-    if (tab === 'editar') return renderForm(trip);
-    if (tab === 'cordada') return go(`#/salida/${trip.id}/grupo`);
-    return renderTrip(trip, TABS.some(([t]) => t === tab) ? tab : 'resumen');
+    if (tab === 'fotos') return renderTrip(trip, 'fotos');
+    return renderTrip(trip, TABS.some(([t]) => t === tab) ? tab : 'salida');
   }
   return renderHome();
 }
@@ -102,7 +138,7 @@ window.addEventListener('hashchange', route);
 
 function header(title, { back = null, actions = '' } = {}) {
   return `<header class="topbar">
-    ${back ? `<a class="icon-btn" href="${back}" aria-label="Volver">←</a>` : '<span class="brand-mark">⛰️</span>'}
+    ${back ? `<a class="icon-btn" href="${back}" aria-label="Volver">←</a>` : '<img class="brand-mark" src="icons/icon.svg" alt="">'}
     <h1>${esc(title)}</h1>
     <div class="actions">${actions}</div>
   </header>`;
@@ -110,278 +146,619 @@ function header(title, { back = null, actions = '' } = {}) {
 
 // ---------- Inicio ----------
 function renderHome() {
-  const trips = [...state.trips].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  const upcoming = trips.filter((t) => (t.endDate || t.date || '9999') >= todayStr()).reverse();
-  const past = trips.filter((t) => !upcoming.includes(t));
+  const p = profile();
+  const trips = [...state.trips].sort((a, b) => (a.date || '9999').localeCompare(b.date || '9999'));
+  const upcoming = trips.filter((t) => (t.endDate || t.date || '9999') >= todayStr());
+  const past = trips.filter((t) => !upcoming.includes(t)).reverse();
   const card = (t) => {
-    const p = gearProgress(t);
-    return `<a class="trip-card" href="#/salida/${t.id}/resumen">
-      <div class="trip-card-top"><h3>${esc(t.name)}</h3><span class="pill">${esc(countdown(t))}</span></div>
-      <p class="muted">${esc(t.peak || 'Sin objetivo')}${t.altitude ? ` · ${t.altitude} m` : ''}${t.date ? ` · ${fmtDate(t.date)}` : ''}</p>
-      <p class="mods">${t.modules.map((m) => MODULES[m]?.icon || '').join(' ')} · ${t.members.length} integrantes${t.syncId ? ' · 🔄' : ''}</p>
-      <div class="progress" title="Equipo listo"><i style="width:${p.pct}%"></i></div>
-      <p class="small muted">Equipo: ${p.done}/${p.total} (${p.pct}%)</p>
+    const mine = gearProgress(t, me(t) || null);
+    return `<a class="trip-card" href="#/salida/${t.id}/salida">
+      <div class="trip-thumb" ${t.info?.photo ? `style="background-image:url('${esc(t.info.photo)}')"` : ''}>${t.info?.photo ? '' : '⛰️'}</div>
+      <div class="trip-body">
+        <div class="trip-card-top"><h3>${esc(t.name)}</h3><span class="pill">${esc(countdown(t))}</span></div>
+        <p class="muted small">${t.altitude ? `${t.altitude.toLocaleString('es-CL')} m · ` : ''}${t.date ? fmtDate(t.date) : 'Sin fecha'} · ${isOwner(t) ? 'Organizas tú' : `Organiza ${esc(firstName(ownerOf(t)?.name || '—'))}`}</p>
+        <div class="progress" title="Mi equipo"><i style="width:${mine.pct}%"></i></div>
+        <p class="small muted">Mi equipo: ${mine.pct}% · ${t.members.filter((m) => m.rsvp !== 'no').length} van</p>
+      </div>
     </a>`;
   };
-  view.innerHTML = `${header('Cordada', { actions: '<a class="icon-btn" href="#/ajustes" aria-label="Ajustes">⚙️</a>' })}
+  view.innerHTML = `${header('Cordada', { actions: `<a class="icon-btn" href="#/ajustes" aria-label="Mi ficha y ajustes">${p ? esc(initials(p.name)) : '👤'}</a>` })}
   <main class="wrap">
-    <div class="row gap">
-      <a class="btn primary grow" href="#/nueva">＋ Nueva salida</a>
-      <label class="btn">Importar<input type="file" accept=".json,application/json" id="import-file" hidden></label>
-    </div>
-    ${trips.length ? '' : `<section class="card empty">
-      <h2>Organiza tu próxima salida</h2>
-      <ul class="features">
-        <li>✅ Checklist de equipo por actividad, personal y grupal, con quién lleva qué</li>
-        <li>🌦️ Pronóstico en la cota de cumbre comparando ECMWF, GFS e ICON, con isoterma 0°</li>
-        <li>🗺️ Mapa topográfico, track GPX, desnivel y tiempo estimado</li>
-        <li>📖 Links a la ruta en Andeshandbook</li>
-        <li>📷 Fotos de la salida a una carpeta compartida de Google Drive</li>
-        <li>🆘 Plan de salida y aviso a tu contacto de emergencia por WhatsApp</li>
-      </ul>
+    ${p ? '' : `<section class="card callout">
+      <h2>Primero, tu ficha</h2>
+      <p>Tu nombre, teléfono y contacto de emergencia se guardan una vez en este teléfono y se usan en todas tus salidas. Así nadie tiene que llenar planillas.</p>
+      <a class="btn primary" href="#/ajustes">Completar mi ficha</a>
     </section>`}
-    ${upcoming.length ? `<h2 class="section-title">Próximas</h2><div class="grid">${upcoming.map(card).join('')}</div>` : ''}
+    <a class="btn primary big" href="#/nueva">＋ Organizar una salida</a>
+    ${upcoming.length ? `<h2 class="section-title">Próximas salidas</h2><div class="grid">${upcoming.map(card).join('')}</div>` : `<section class="card empty">
+      <h2>¿Cómo funciona?</h2>
+      <ol class="steps">
+        <li><b>El encargado elige el cerro y la fecha.</b> La app completa sola la altura, la ruta, el desnivel, el clima y el tipo de salida.</li>
+        <li><b>Invita al grupo</b> con un link por WhatsApp.</li>
+        <li><b>Cada invitado toca "Voy"</b> y recibe su lista de equipo según la salida y el pronóstico.</li>
+        <li><b>El encargado organiza con un toque</b> las cordadas, los autos y quién lleva el equipo común, y envía el aviso de salida.</li>
+      </ol>
+    </section>`}
     ${past.length ? `<h2 class="section-title">Realizadas</h2><div class="grid">${past.map(card).join('')}</div>` : ''}
   </main>`;
-  $('#import-file').addEventListener('change', importFromFile);
 }
 
-async function importFromFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  try {
-    const data = JSON.parse(await file.text());
-    if (Array.isArray(data.trips)) {
-      data.trips.forEach(importTrip);
-      toast(`${data.trips.length} salidas importadas`);
-      go('#/');
-    } else {
-      const t = importTrip(data);
-      go(`#/salida/${t.id}/resumen`);
+// ---------- Organizar salida ----------
+const KIND_ICON = { peak: '⛰️', volcano: '🌋', hill: '⛰️', glacier: '🧊', place: '📍' };
+
+function renderCreate() {
+  const draft = ui.draft || (ui.draft = { place: null, date: '', endDate: '', overrides: {} });
+  const p = profile();
+  view.innerHTML = `${header('Organizar salida', { back: '#/' })}
+  <main class="wrap narrow">
+    <section class="card">
+      <h2>¿A qué cerro van?</h2>
+      <form id="search" class="row gap">
+        <input id="q" class="grow" placeholder="Ej: Cerro El Plomo, Volcán Lonquimay…" autocomplete="off" value="${esc(draft.q || '')}">
+        <button class="btn primary" type="submit">Buscar</button>
+      </form>
+      <ul id="results" class="results"></ul>
+      <div id="picked"></div>
+    </section>
+    <section class="card">
+      <h2>¿Cuándo?</h2>
+      <div class="cols2">
+        <label>Desde<input type="date" id="d1" value="${esc(draft.date)}" min="${todayStr()}"></label>
+        <label>Hasta (si es más de un día)<input type="date" id="d2" value="${esc(draft.endDate)}"></label>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Tipo de salida</h2>
+      <p class="small muted">Se detecta solo con la altura, la fecha y (al crearla) el pronóstico y los glaciares. Puedes corregirlo.</p>
+      <div id="kinds" class="chips"></div>
+    </section>
+    ${p ? '' : `<section class="card">
+      <h2>Tus datos como encargado</h2>
+      <form id="ficha-mini" class="form">${fichaForm({}, { compact: true })}</form>
+    </section>`}
+    <button class="btn primary big" id="create">Crear salida e invitar</button>
+  </main>`;
+
+  const renderPicked = () => {
+    const pl = draft.place;
+    $('#picked').innerHTML = pl ? `<div class="picked">
+      <span class="kind">${KIND_ICON[pl.kind] || '📍'}</span>
+      <div class="grow"><b>${esc(pl.name)}</b><div class="small muted">${pl.altitude ? `${Math.round(pl.altitude).toLocaleString('es-CL')} m · ` : ''}${esc(pl.region)}</div>
+      <div class="small muted">${pl.lat.toFixed(4)}, ${pl.lon.toFixed(4)} · ${esc(pl.sources.join(' + '))}</div></div>
+      <button class="btn small" id="unpick">Cambiar</button></div>` : '';
+    $('#unpick')?.addEventListener('click', () => { draft.place = null; renderPicked(); renderKinds(); });
+  };
+  const renderKinds = () => {
+    const fake = { altitude: draft.place?.altitude, lat: draft.place?.lat, date: draft.date, endDate: draft.endDate, overrides: draft.overrides, info: {} };
+    const det = detect(fake);
+    const ids = [...AUTO_MODULES, ...MANUAL_MODULES];
+    $('#kinds').innerHTML = ids.map((id) => {
+      const on = draft.overrides[id] ?? !!det[id];
+      return `<button type="button" class="chip toggle ${on ? 'on' : ''}" data-mod="${id}" aria-pressed="${on}" title="${esc(det[id] || '')}">${MODULES[id].icon} ${MODULES[id].label}${det[id] && draft.overrides[id] === undefined ? '<span class="auto">auto</span>' : ''}</button>`;
+    }).join('');
+    $$('[data-mod]').forEach((b) => b.addEventListener('click', () => {
+      const id = b.dataset.mod;
+      const cur = draft.overrides[id] ?? !!det[id];
+      draft.overrides[id] = !cur;
+      renderKinds();
+    }));
+  };
+  $('#search').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const q = $('#q').value.trim();
+    draft.q = q;
+    if (!q) return;
+    const ul = $('#results');
+    ul.innerHTML = '<li class="muted small">Buscando en OpenStreetMap, Wikidata y GeoNames…</li>';
+    try {
+      const res = await searchPlaces(q);
+      ul.innerHTML = res.length ? res.map((r, i) => `<li><button type="button" data-i="${i}"><span class="kind">${KIND_ICON[r.kind] || '📍'}</span><span class="grow"><b>${esc(r.name)}</b>${r.altitude ? ` · ${Math.round(r.altitude).toLocaleString('es-CL')} m` : ''}<span class="small muted"> ${esc(r.region)}</span></span></button></li>`).join('')
+        : '<li class="muted small">Sin resultados. Prueba con otro nombre (ej. sin "cerro").</li>';
+      $$('button[data-i]', ul).forEach((b) => b.addEventListener('click', () => {
+        draft.place = res[b.dataset.i];
+        ul.innerHTML = '';
+        renderPicked();
+        renderKinds();
+      }));
+    } catch (err) {
+      ul.innerHTML = `<li class="alert warn">${esc(err.message)}. Revisa tu conexión.</li>`;
     }
-  } catch (err) {
-    alert(`No se pudo importar: ${err.message}`);
+  });
+  $('#d1').addEventListener('change', (e) => { draft.date = e.target.value; if (draft.endDate && draft.endDate < draft.date) draft.endDate = ''; $('#d2').min = draft.date; renderKinds(); });
+  $('#d2').addEventListener('change', (e) => { draft.endDate = e.target.value; renderKinds(); });
+  $('#create').addEventListener('click', async () => {
+    if (!draft.place) return toast('Elige el cerro o lugar');
+    if (!draft.date) return toast('Elige la fecha');
+    let prof = profile();
+    if (!prof) {
+      const f = $('#ficha-mini');
+      if (!f.reportValidity()) return;
+      prof = readFicha(f);
+      state.settings.profile = prof;
+    }
+    const pl = draft.place;
+    const owner = { ...memberFromProfile(prof), rsvp: 'si' };
+    const trip = newTrip({
+      name: pl.name,
+      peak: pl.name,
+      lat: +pl.lat.toFixed(6),
+      lon: +pl.lon.toFixed(6),
+      altitude: pl.altitude ? Math.round(pl.altitude) : null,
+      date: draft.date,
+      endDate: draft.endDate && draft.endDate > draft.date ? draft.endDate : '',
+      overrides: { ...draft.overrides },
+      info: { region: pl.region, kind: pl.kind, wikidata: pl.wikidata || null, wikipedia: pl.wikipedia || null, sources: pl.sources },
+      ownerId: owner.id,
+      members: [owner],
+      modules: [],
+    });
+    trip.org.leaderId = owner.id;
+    setMe(trip, owner.id);
+    syncGear(trip);
+    save();
+    ui.draft = null;
+    if (getSyncer()) enableSync(trip).catch((e) => console.warn('Sync', e));
+    go(`#/salida/${trip.id}/salida`);
+    enrich(trip);
+  });
+  renderPicked();
+  renderKinds();
+}
+
+// ---------- Datos automáticos (en segundo plano) ----------
+const enriching = new Set();
+async function enrich(trip, { force = false } = {}) {
+  if (enriching.has(trip.id) || trip.lat == null) return;
+  enriching.add(trip.id);
+  const refresh = () => { saveLocal(); if (location.hash.startsWith(`#/salida/${trip.id}/`)) rerenderTab(trip); };
+  try {
+    const tasks = [];
+    // Pronóstico: local en cada teléfono.
+    if (force || !trip.weather || Date.now() - new Date(trip.weather.fetchedAt) > 3 * 3600e3) {
+      tasks.push(fetchWeather(trip).then((w) => { trip.weather = w; }).catch(() => {}));
+    }
+    if (canAuto(trip)) {
+      trip.info ||= {};
+      if (force || !trip.info.detailsAt) {
+        tasks.push(placeDetails({ ...trip.info, lat: trip.lat, lon: trip.lon, altitude: trip.altitude }).then((d) => {
+          Object.assign(trip.info, { photo: d.photo || trip.info.photo || null, description: d.description || trip.info.description || null, wikipediaUrl: d.wikipediaUrl || null, detailsAt: Date.now() });
+          if (!trip.altitude && d.altitude) { trip.altitude = d.altitude; trip.info.altitudeEstimated = !!d.altitudeEstimated; }
+        }).catch(() => {}));
+      }
+      if (force || !trip.info.surroundAt) {
+        tasks.push(surroundings(trip.lat, trip.lon).then(async (s) => {
+          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now() });
+          if (s.start && (!trip.gpx || trip.gpx.auto)) {
+            const r = await hikingRoute(s.start, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude });
+            trip.gpx = {
+              name: r.source === 'brouter' ? 'Ruta sugerida por senderos' : 'Ruta estimada (línea recta)',
+              auto: true,
+              source: r.source,
+              pts: r.pts,
+              wpts: [{ lat: s.start.lat, lon: s.start.lon, ele: r.pts[0]?.ele ?? null, name: s.start.name }, { lat: trip.lat, lon: trip.lon, ele: trip.altitude, name: trip.peak }],
+              stats: r.stats,
+            };
+          }
+        }).catch(() => {}));
+      }
+    }
+    await Promise.all(tasks);
+    if (canAuto(trip)) syncGear(trip);
+    if (isOwner(trip)) autoOrganize(trip);
+    if (canAuto(trip)) save(); else saveLocal();
+    refresh();
+  } finally {
+    enriching.delete(trip.id);
   }
 }
 
-// ---------- Formulario de salida ----------
-function renderForm(trip) {
-  const t = trip || { name: '', peak: '', date: '', endDate: '', lat: null, lon: null, altitude: null, andesUrl: '', notes: '', modules: ['base'] };
-  view.innerHTML = `${header(trip ? 'Editar salida' : 'Nueva salida', { back: trip ? `#/salida/${trip.id}/resumen` : '#/' })}
-  <main class="wrap narrow">
-    <form id="trip-form" class="card form">
-      <label>Nombre de la salida<input name="name" required value="${esc(t.name)}" placeholder="Ej: Cerro Plomo por Refugio Federación"></label>
-      <label>Objetivo / cerro<input name="peak" value="${esc(t.peak)}" placeholder="Ej: Cerro Plomo"></label>
-      <div class="search-box">
-        <label>Buscar ubicación<span class="row gap"><input id="geo-q" placeholder="Nombre del cerro o lugar" value="${esc(t.peak)}"><button type="button" class="btn" id="geo-btn">Buscar</button></span></label>
-        <ul id="geo-results" class="results"></ul>
-      </div>
-      <div class="cols3">
-        <label>Latitud<input name="lat" inputmode="decimal" value="${t.lat ?? ''}" placeholder="-33.235"></label>
-        <label>Longitud<input name="lon" inputmode="decimal" value="${t.lon ?? ''}" placeholder="-70.215"></label>
-        <label>Altitud (m)<input name="altitude" type="number" value="${t.altitude ?? ''}" placeholder="5424"></label>
-      </div>
-      <p class="small muted">También puedes fijar el punto en el mapa o tomarlo del track GPX.</p>
-      <div class="cols2">
-        <label>Fecha de inicio<input type="date" name="date" value="${esc(t.date)}"></label>
-        <label>Fecha de término<input type="date" name="endDate" value="${esc(t.endDate)}"></label>
-      </div>
-      <fieldset>
-        <legend>Tipo de actividad (define el equipo sugerido)</legend>
-        <div class="chips">
-          ${Object.entries(MODULES).map(([id, m]) => `<label class="chip"><input type="checkbox" name="modules" value="${id}" ${t.modules.includes(id) ? 'checked' : ''} ${trip && t.modules.includes(id) ? 'disabled' : ''}>${m.icon} ${m.label}</label>`).join('')}
-        </div>
-      </fieldset>
-      <label>Ruta en Andeshandbook (URL, opcional)<input name="andesUrl" type="url" value="${esc(t.andesUrl)}" placeholder="https://www.andeshandbook.org/montanismo/cerro/..."></label>
-      <p class="small"><a href="#" id="ah-search">Buscar el cerro en Andeshandbook ↗</a></p>
-      <label>Notas<textarea name="notes" rows="3">${esc(t.notes)}</textarea></label>
-      <button class="btn primary" type="submit">${trip ? 'Guardar cambios' : 'Crear salida'}</button>
+function rerenderTab(trip) {
+  const typing = document.activeElement?.matches?.('input, textarea, select');
+  const tab = location.hash.split('/')[3] || 'salida';
+  const el = $('#tab');
+  if (!el || typing || tab === 'mapa' || tab === 'aviso') return;
+  const y = window.scrollY;
+  renderTrip(trip, tab);
+  window.scrollTo(0, y);
+}
+
+// ---------- Vista de salida ----------
+function renderTrip(trip, tab) {
+  const owner = isOwner(trip);
+  const tabs = TABS.filter(([, , who]) => !who || owner);
+  view.innerHTML = `${header(trip.name, {
+    back: '#/',
+    actions: `${trip.syncId ? `<span class="icon-btn sync-dot" id="sync-dot" data-sync="${trip.syncId}"></span>` : ''}`,
+  })}
+  <nav class="tabs" role="tablist">
+    ${tabs.map(([id, label]) => `<a role="tab" href="#/salida/${trip.id}/${id}" class="${id === tab ? 'active' : ''}" aria-selected="${id === tab}">${label}</a>`).join('')}
+  </nav>
+  <main class="wrap" id="tab"></main>`;
+  if (trip.syncId) setDot($('#sync-dot'), syncStatus[trip.syncId]);
+  const el = $('#tab');
+  ({ salida: tabInfo, equipo: tabMyGear, grupo: tabGroup, clima: tabWeather, mapa: tabMap, aviso: tabPlan, fotos: tabPhotos })[tab](trip, el);
+  $('.tabs .active')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  if (!enriching.has(trip.id)) enrich(trip);
+}
+
+const hm = (h) => `${Math.floor(h)} h ${String(Math.round((h % 1) * 60)).padStart(2, '0')} min`;
+
+// --- Salida: toda la información, automática ---
+function tabInfo(trip, el) {
+  const owner = isOwner(trip);
+  const mine = myMember(trip);
+  const org = ownerOf(trip);
+  const s = trip.gpx?.stats;
+  const start = trip.info?.start;
+  const d = trip.weather?.daily?.daily;
+  const dates = tripDates(trip);
+  const going = trip.members.filter((m) => m.rsvp !== 'no');
+  const { ids, detected } = activeModules(trip);
+  const alerts = trip.weather ? assess(trip.weather, dates) : null;
+  const up = s?.up || (trip.altitude && s?.minEle != null ? trip.altitude - s.minEle : null);
+
+  el.innerHTML = `
+  <section class="hero-card" ${trip.info?.photo ? `style="--photo:url('${esc(trip.info.photo)}')"` : ''}>
+    <div class="hero-inner">
+      <p class="eyebrow">${esc(countdown(trip))}</p>
+      <h2>${esc(trip.peak || trip.name)}</h2>
+      <p>${trip.altitude ? `<b>${trip.altitude.toLocaleString('es-CL')} m s.n.m.</b>${trip.info?.altitudeEstimated ? ' (aprox.)' : ''} · ` : ''}${esc(trip.info?.region || '')}</p>
+      <p>${fmtDate(trip.date, { weekday: 'long', day: 'numeric', month: 'long' })}${trip.endDate ? ` → ${fmtDate(trip.endDate, { weekday: 'long', day: 'numeric', month: 'long' })}` : ''}</p>
+      <p class="small">Organiza ${esc(org?.name || '—')}${org?.phone ? ` · <a href="https://wa.me/${esc(waNumber(org.phone))}" target="_blank" rel="noopener">WhatsApp</a>` : ''}</p>
+    </div>
+  </section>
+
+  ${owner ? `<section class="card invite">
+    <div class="row between wrap-row"><div><h3>Invitar al grupo</h3><p class="small muted">${going.length} van · ${trip.members.filter((m) => m.rsvp === 'no').length} no pueden</p></div>
+    <button class="btn primary" id="invite">📲 Invitar por WhatsApp</button></div>
+  </section>` : mine ? `<section class="card rsvp-card">
+    <div class="row between wrap-row"><p>${mine.rsvp === 'no' ? '❌ Marcaste que <b>no vas</b>.' : '✅ <b>Vas a esta salida.</b>'}</p>
+    <button class="btn small" id="rsvp-toggle">${mine.rsvp === 'no' ? 'Ahora sí voy' : 'Ya no puedo ir'}</button></div>
+    ${!trip.syncId && org?.phone ? `<a class="btn small top-gap" id="notify-owner" target="_blank" rel="noopener">Avisar a ${esc(firstName(org.name))} por WhatsApp</a>` : ''}
+  </section>` : `<section class="card rsvp-card callout">
+    <h3>¿Vas a esta salida?</h3>
+    ${profile() ? '' : `<form id="ficha-mini" class="form">${fichaForm({}, { compact: true })}</form>`}
+    <div class="row gap top-gap"><button class="btn primary grow" id="rsvp-yes">Voy</button><button class="btn" id="rsvp-no">No puedo</button></div>
+  </section>`}
+
+  <section class="card">
+    <h3>La ruta</h3>
+    <dl class="stats">
+      <div><dt>Cumbre</dt><dd>${trip.altitude ? `${trip.altitude.toLocaleString('es-CL')} m` : '—'}</dd></div>
+      <div><dt>Desnivel</dt><dd>${up ? `${Math.round(up).toLocaleString('es-CL')} m` : '…'}</dd></div>
+      <div><dt>Distancia (ida)</dt><dd>${s ? `${s.distKm.toFixed(1)} km` : '…'}</dd></div>
+      <div><dt>Tiempo (ida)</dt><dd>${s ? hm(s.hours) : '…'}</dd></div>
+      ${d && dates[0] && d.time.includes(dates[0]) ? `<div><dt>Luz del día</dt><dd>${fmtHour(d.sunrise[d.time.indexOf(dates[0])])}–${fmtHour(d.sunset[d.time.indexOf(dates[0])])}</dd></div>` : ''}
+    </dl>
+    <p class="small muted">${!trip.info?.surroundAt ? 'Calculando punto de partida y ruta…'
+      : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? 'Ruta calculada sobre senderos de OpenStreetMap desde el punto de partida más cercano. Revísala en el Mapa: puede no ser la ruta normal.' : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
+      : trip.gpx ? `Track cargado: ${esc(trip.gpx.name || '')}.` : 'No se encontró un camino cercano: carga el track GPX en el Mapa.'}
+      Tiempo según Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos.</p>
+    <div class="link-list top-gap">
+      ${start ? `<a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${start.lat},${start.lon}" target="_blank" rel="noopener">🚗 Cómo llegar a ${esc(start.name)}</a>` : ''}
+      ${trip.andesUrl ? `<a class="btn" href="${esc(trip.andesUrl)}" target="_blank" rel="noopener">📖 Ruta en Andeshandbook</a>` : `<a class="btn" href="${andesSearch(trip.peak)}" target="_blank" rel="noopener">📖 Buscar en Andeshandbook</a>`}
+      <a class="btn" href="https://www.google.com/search?q=${encodeURIComponent(`wikiloc ${trip.peak}`)}" target="_blank" rel="noopener">🥾 Tracks en Wikiloc</a>
+      <a class="btn" href="#/salida/${trip.id}/mapa">🗺️ Ver mapa</a>
+    </div>
+    ${trip.info?.huts?.length ? `<p class="small top-gap">🛖 Refugios cerca: ${trip.info.huts.map((h) => esc(h.name)).join(', ')}</p>` : ''}
+    ${owner ? `<form id="ah-form" class="row gap top-gap"><input name="url" type="url" class="grow" placeholder="Pega el link de la ruta en Andeshandbook (opcional)" value="${esc(trip.andesUrl || '')}"><button class="btn small" type="submit">Guardar</button></form>` : ''}
+  </section>
+
+  <section class="card">
+    <div class="row between"><h3>Clima en la cumbre</h3><a href="#/salida/${trip.id}/clima">Detalle →</a></div>
+    ${d ? `<div class="days compact">${dates.filter((t) => d.time.includes(t)).map((t) => {
+      const i = d.time.indexOf(t);
+      const [ic, desc] = wmo(d.weather_code[i]);
+      return `<div class="day trip" title="${esc(desc)}"><span class="small">${fmtDayShort(t)}</span><span class="wx-icon">${ic}</span><b>${Math.round(d.temperature_2m_max[i])}° / ${Math.round(d.temperature_2m_min[i])}°</b><span class="small">💨 ${Math.round(d.wind_gusts_10m_max[i])} km/h</span><span class="small">${d.precipitation_sum[i] ? `💧 ${d.precipitation_sum[i].toFixed(1)} mm` : 'sin precipitación'}</span></div>`;
+    }).join('') || '<p class="small muted">La fecha aún está fuera del pronóstico (14 días). Se completa solo cuando se acerque.</p>'}</div>` : '<p class="small muted">Descargando pronóstico…</p>'}
+    ${alerts ? alertList(alerts) : ''}
+  </section>
+
+  <section class="card">
+    <h3>Tipo de salida</h3>
+    <div class="chips">${[...AUTO_MODULES, ...MANUAL_MODULES].filter((id) => owner || ids.includes(id)).map((id) => {
+      const on = ids.includes(id);
+      return owner ? `<button type="button" class="chip toggle ${on ? 'on' : ''}" data-mod="${id}" aria-pressed="${on}">${MODULES[id].icon} ${MODULES[id].label}</button>`
+        : `<span class="chip on">${MODULES[id].icon} ${MODULES[id].label}</span>`;
+    }).join('') || '<span class="muted small">Trekking de día</span>'}</div>
+    <ul class="reasons small muted">${Object.entries(detected).filter(([id]) => id !== 'base' && ids.includes(id)).map(([id, why]) => `<li>${MODULES[id].icon} ${esc(why)}</li>`).join('')}</ul>
+    <p class="small"><a href="#/salida/${trip.id}/equipo">Ver mi equipo según esta salida →</a></p>
+  </section>
+
+  ${trip.info?.description ? `<section class="card"><h3>Sobre el lugar</h3><p class="desc">${esc(trip.info.description)}</p>${trip.info.wikipediaUrl ? `<p class="small"><a href="${esc(trip.info.wikipediaUrl)}" target="_blank" rel="noopener">Wikipedia ↗</a></p>` : ''}</section>` : ''}
+
+  <section class="card">
+    <h3>Fotos de la salida</h3>
+    ${trip.drive?.folderUrl ? `<a class="btn primary" href="${esc(trip.drive.folderUrl)}" target="_blank" rel="noopener">📁 Ver y subir fotos</a>` : `<p class="small muted">${owner ? 'Pega el link de una carpeta compartida de Google Drive o un álbum de Google Fotos para que todos suban sus fotos.' : 'El encargado aún no comparte una carpeta de fotos.'}</p>`}
+    ${owner ? `<form id="photos-form" class="row gap top-gap"><input name="url" type="url" class="grow" placeholder="https://drive.google.com/…" value="${esc(trip.drive?.folderUrl || '')}"><button class="btn small" type="submit">Guardar</button></form>` : ''}
+    ${DRIVE_CLIENT_ID ? `<p class="small top-gap"><a href="#/salida/${trip.id}/fotos">Subir directo desde la app →</a></p>` : ''}
+  </section>
+
+  <section class="card quiet">
+    <div class="link-list">
+      ${owner ? '<button class="btn small" id="edit-date">Cambiar fecha</button>' : ''}
+      <button class="btn small" id="share-copy">Compartir copia</button>
+      <button class="btn small danger" id="delete">${owner ? 'Eliminar salida' : 'Salir de esta salida'}</button>
+    </div>
+    <form id="date-form" class="cols2 top-gap" hidden>
+      <label>Desde<input type="date" name="date" value="${esc(trip.date)}"></label>
+      <label>Hasta<input type="date" name="endDate" value="${esc(trip.endDate)}"></label>
+      <button class="btn primary" type="submit">Guardar fecha</button>
     </form>
-  </main>`;
+  </section>`;
 
-  const form = $('#trip-form');
-  const doSearch = async () => {
-    const q = $('#geo-q').value.trim();
-    if (!q) return;
-    const ul = $('#geo-results');
-    ul.innerHTML = '<li class="muted">Buscando…</li>';
-    try {
-      const res = await geocode(q);
-      ul.innerHTML = res.length
-        ? res.map((r, i) => `<li><button type="button" data-i="${i}">${esc(r.name)}<span class="muted"> · ${esc([r.admin1, r.country].filter(Boolean).join(', '))}${r.elevation ? ` · ${Math.round(r.elevation)} m` : ''}</span></button></li>`).join('')
-        : '<li class="muted">Sin resultados. Prueba otro nombre o fija el punto en el mapa.</li>';
-      $$('button[data-i]', ul).forEach((b) => b.addEventListener('click', () => {
-        const r = res[b.dataset.i];
-        form.lat.value = r.latitude.toFixed(5);
-        form.lon.value = r.longitude.toFixed(5);
-        if (r.elevation) form.altitude.value = Math.round(r.elevation);
-        if (!form.peak.value) form.peak.value = r.name;
-        ul.innerHTML = '';
-      }));
-    } catch (err) {
-      ul.innerHTML = `<li class="muted">${esc(err.message)}</li>`;
-    }
-  };
-  $('#geo-btn').addEventListener('click', doSearch);
-  $('#geo-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
-  $('#ah-search').addEventListener('click', (e) => {
-    e.preventDefault();
-    window.open(andesSearch(form.peak.value || form.name.value), '_blank', 'noopener');
-  });
-
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const f = new FormData(form);
-    const num = (k) => (f.get(k) === '' || f.get(k) == null ? null : Number(String(f.get(k)).replace(',', '.')));
-    const fields = {
-      name: f.get('name').trim(),
-      peak: f.get('peak').trim(),
-      lat: num('lat'),
-      lon: num('lon'),
-      altitude: num('altitude'),
-      date: f.get('date'),
-      endDate: f.get('endDate'),
-      andesUrl: f.get('andesUrl').trim(),
-      notes: f.get('notes'),
-    };
-    if ((fields.lat == null) !== (fields.lon == null) || (fields.lat != null && (Math.abs(fields.lat) > 90 || Math.abs(fields.lon) > 180))) {
-      alert('Revisa latitud y longitud.');
-      return;
-    }
-    const mods = f.getAll('modules');
-    let target = trip;
-    if (trip) {
-      const moved = trip.lat !== fields.lat || trip.lon !== fields.lon || trip.altitude !== fields.altitude;
-      Object.assign(trip, fields);
-      if (moved) delete trip.weather;
-    } else {
-      target = newTrip({ ...fields, modules: [] });
-      if (!mods.length) mods.push('base');
-    }
-    addModules(target, mods);
+  $('#invite', el)?.addEventListener('click', () => invite(trip));
+  $('#rsvp-yes', el)?.addEventListener('click', () => joinTrip(trip, 'si', el));
+  $('#rsvp-no', el)?.addEventListener('click', () => joinTrip(trip, 'no', el));
+  $('#rsvp-toggle', el)?.addEventListener('click', () => {
+    mine.rsvp = mine.rsvp === 'no' ? 'si' : 'no';
+    if (isOwner(trip)) autoOrganize(trip);
     save();
-    go(`#/salida/${target.id}/resumen`);
+    tabInfo(trip, el);
+  });
+  const notify = $('#notify-owner', el);
+  if (notify) notify.href = replyLink(trip, mine);
+  $$('[data-mod]', el).forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.mod;
+    const on = !ids.includes(id);
+    trip.overrides = { ...(trip.overrides || {}), [id]: on };
+    syncGear(trip);
+    save();
+    tabInfo(trip, el);
+    toast(on ? `Agregado: ${MODULES[id].label}` : `Quitado: ${MODULES[id].label}`);
+  }));
+  $('#ah-form', el)?.addEventListener('submit', (e) => { e.preventDefault(); trip.andesUrl = e.target.url.value.trim(); save(); toast('Link guardado'); tabInfo(trip, el); });
+  $('#photos-form', el)?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const url = e.target.url.value.trim();
+    const m = url.match(/folders\/([\w-]+)/);
+    trip.drive = { ...(trip.drive || {}), folderUrl: url, folderId: m ? m[1] : trip.drive?.folderId };
+    save();
+    toast('Carpeta guardada');
+    tabInfo(trip, el);
+  });
+  $('#edit-date', el)?.addEventListener('click', () => { $('#date-form', el).hidden = false; });
+  $('#date-form', el).addEventListener('submit', (e) => {
+    e.preventDefault();
+    trip.date = e.target.date.value || trip.date;
+    trip.endDate = e.target.endDate.value > trip.date ? e.target.endDate.value : '';
+    delete trip.weather;
+    syncGear(trip);
+    save();
+    renderTrip(trip, 'salida');
+  });
+  $('#share-copy', el).addEventListener('click', async () => {
+    const url = `${location.origin}${location.pathname}#/importar/${await encodeTrip(trip)}`;
+    shareOrCopy({ title: trip.name, text: `Salida "${trip.name}" (copia)`, url });
+  });
+  $('#delete', el).addEventListener('click', () => {
+    if (!confirm(owner ? `¿Eliminar "${trip.name}" de este teléfono?` : '¿Salir de esta salida? Se borra de este teléfono.')) return;
+    if (!owner && mine && trip.syncId) { mine.rsvp = 'no'; save(); }
+    if (trip.syncId) syncer?.unwatch(trip.syncId);
+    deleteTrip(trip.id);
+    go('#/');
   });
 }
 
 const andesSearch = (q) => `https://www.google.com/search?q=${encodeURIComponent(`site:andeshandbook.org ${q}`)}`;
 
-// ---------- Vista de salida ----------
-function renderTrip(trip, tab) {
-  view.innerHTML = `${header(trip.name, {
-    back: '#/',
-    actions: `${trip.syncId ? `<span class="icon-btn sync-dot" id="sync-dot" data-sync="${trip.syncId}"></span>` : ''}<a class="icon-btn" href="#/salida/${trip.id}/editar" aria-label="Editar">✏️</a>`,
-  })}
-  <nav class="tabs" role="tablist">
-    ${TABS.map(([id, label]) => `<a role="tab" href="#/salida/${trip.id}/${id}" class="${id === tab ? 'active' : ''}" aria-selected="${id === tab}">${label}</a>`).join('')}
-  </nav>
-  <main class="wrap" id="tab"></main>`;
-  const el = $('#tab');
-  if (trip.syncId) setDot($('#sync-dot'), syncStatus[trip.syncId]);
-  ({ resumen: tabSummary, grupo: tabGroup, equipo: tabGear, clima: tabWeather, mapa: tabMap, fotos: tabPhotos, plan: tabPlan })[tab](trip, el);
-  $('.tabs .active')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+// Unirse a la salida con la ficha guardada.
+function joinTrip(trip, rsvp, el) {
+  let prof = profile();
+  if (!prof) {
+    const f = $('#ficha-mini', el);
+    if (f && !f.reportValidity()) return;
+    prof = readFicha(f);
+    state.settings.profile = prof;
+  }
+  let m = trip.members.find((x) => x.phone && waNumber(x.phone) === waNumber(prof.phone));
+  if (m) Object.assign(m, memberFromProfile(prof), { id: m.id });
+  else { m = memberFromProfile(prof); trip.members.push(m); }
+  m.rsvp = rsvp;
+  setMe(trip, m.id);
+  save();
+  toast(rsvp === 'si' ? '¡Listo! Ya tienes tu lista de equipo.' : 'Avisado: no vas.');
+  if (rsvp === 'si') go(`#/salida/${trip.id}/equipo`);
+  else tabInfo(trip, el);
 }
 
-// --- Resumen ---
-function tabSummary(trip, el) {
-  const p = gearProgress(trip);
-  const w = weightByMember(trip);
-  const alerts = trip.weather ? assess(trip.weather, tripDates(trip)) : null;
-  const hasPos = trip.lat != null;
+// Invitación: salida sincronizada (link corto) o copia en el link.
+async function invite(trip) {
+  let url;
+  if (getSyncer()) {
+    try {
+      if (!trip.syncId) await enableSync(trip);
+      url = `${location.origin}${location.pathname}#/unirse/${trip.syncId}`;
+    } catch (e) { console.warn(e); }
+  }
+  url ||= `${location.origin}${location.pathname}#/importar/${await encodeTrip(trip)}`;
+  const d = trip.date ? fmtDate(trip.date, { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+  const text = `⛰️ ${trip.peak}${trip.altitude ? ` (${trip.altitude.toLocaleString('es-CL')} m)` : ''}${d ? `, ${d}` : ''}.\nConfirma si vas y revisa tu equipo aquí:`;
+  shareOrCopy({ title: `Salida: ${trip.name}`, text, url, whatsapp: true });
+}
+
+// Sin sincronización: el invitado le manda su confirmación al encargado con un link.
+function replyLink(trip, m) {
+  const org = ownerOf(trip);
+  const payload = btoa(unescape(encodeURIComponent(JSON.stringify({ t: trip.id, m })))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const url = `${location.origin}${location.pathname}#/respuesta/${payload}`;
+  const text = `${m.rsvp === 'no' ? '❌ No puedo ir' : '✅ Voy'} a ${trip.peak}. Toca para sumarme a la lista: ${url}`;
+  return `https://wa.me/${waNumber(org?.phone || '')}?text=${encodeURIComponent(text)}`;
+}
+
+function renderReply(code) {
+  view.innerHTML = `${header('Confirmación', { back: '#/' })}<main class="wrap narrow"><section class="card" id="box"></section></main>`;
+  const box = $('#box');
+  try {
+    const { t, m } = JSON.parse(decodeURIComponent(escape(atob(code.replace(/-/g, '+').replace(/_/g, '/')))));
+    const trip = getTrip(t);
+    if (!trip) throw new Error('No tienes esa salida en este teléfono');
+    const existing = trip.members.find((x) => x.id === m.id || (x.phone && waNumber(x.phone) === waNumber(m.phone)));
+    if (existing) Object.assign(existing, m, { id: existing.id }); else trip.members.push(m);
+    if (canAuto(trip)) { syncGear(trip); if (isOwner(trip)) autoOrganize(trip); }
+    save();
+    box.innerHTML = `<p class="alert good">✅ ${esc(m.name)} ${m.rsvp === 'no' ? 'no va' : 'va'} a ${esc(trip.name)}. Sus datos quedaron en la salida.</p><a class="btn primary top-gap" href="#/salida/${trip.id}/grupo">Ver el grupo</a>`;
+  } catch (err) {
+    box.innerHTML = `<p class="alert warn">${esc(err.message)}</p>`;
+  }
+}
+
+// --- Mi equipo: la lista personal, automática ---
+function tabMyGear(trip, el) {
+  const myId = me(trip);
+  const mine = myMember(trip);
+  if (!mine) {
+    el.innerHTML = `<section class="card"><p>Confirma que vas en la pestaña <a href="#/salida/${trip.id}/salida">Salida</a> y aquí aparecerá tu lista de equipo.</p></section>`;
+    return;
+  }
+  const { ids, detected } = activeModules(trip);
+  const myRope = ropeOfMember(trip, myId);
+  const personal = trip.gear.filter((g) => g.scope === 'p' && (!g.owner || g.owner === myId));
+  const wx = personal.filter((g) => g.mod === 'wx');
+  const rest = personal.filter((g) => g.mod !== 'wx');
+  const carry = trip.gear.filter((g) => (g.scope === 'g' && g.assignee === myId) || (g.scope === 'c' && myRope && g.carriers?.[myRope.id] === myId));
+  const isDone = (g) => (g.scope === 'p' ? !!g.checks?.[myId] : g.scope === 'c' ? !!g.checks?.[ropeKey(myRope)] : !!g.checked);
+  const all = [...personal, ...carry];
+  const done = all.filter(isDone).length;
+  const pct = all.length ? Math.round((done / all.length) * 100) : 0;
+  const weight = all.reduce((a, g) => a + (Number(g.weight) || 0), 0);
+  const byCat = {};
+  rest.forEach((g) => { (byCat[g.cat] ||= []).push(g); });
+  const row = (g) => `<li class="gear ${isDone(g) ? 'done' : ''}">
+    <label class="gear-check"><input type="checkbox" data-id="${g.id}" ${isDone(g) ? 'checked' : ''}>
+    <span class="grow"><span class="gname">${esc(g.name)}</span>${g.reason ? `<span class="small muted"> · ${esc(g.reason)}</span>` : ''}</span></label>
+    ${g.owner === myId ? `<button class="icon-btn small" data-del="${g.id}" aria-label="Quitar">×</button>` : ''}
+  </li>`;
+
   el.innerHTML = `
-  <section class="card hero">
-    <div>
-      <p class="eyebrow">${esc(countdown(trip))}</p>
-      <h2>${esc(trip.peak || trip.name)}</h2>
-      <p class="muted">${trip.date ? fmtDate(trip.date, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : 'Sin fecha'}${trip.endDate && trip.endDate !== trip.date ? ` → ${fmtDate(trip.endDate)}` : ''}</p>
-      <p class="mods">${trip.modules.map((m) => `${MODULES[m]?.icon || ''} ${MODULES[m]?.label || m}`).join(' · ')}</p>
-    </div>
-    <dl class="stats">
-      <div><dt>Altitud</dt><dd>${trip.altitude ? `${trip.altitude} m` : '—'}</dd></div>
-      <div><dt>Equipo listo</dt><dd>${p.pct}%</dd></div>
-      <div><dt>Integrantes</dt><dd>${trip.members.length}</dd></div>
-      ${trip.gpx ? `<div><dt>Distancia</dt><dd>${trip.gpx.stats.distKm.toFixed(1)} km</dd></div><div><dt>Desnivel +</dt><dd>${trip.gpx.stats.up} m</dd></div>` : ''}
-    </dl>
+  <section class="card sticky-summary">
+    <div class="row between"><b>Mi equipo · ${done}/${all.length}</b><b>${pct}%</b></div>
+    <div class="progress big"><i style="width:${pct}%"></i></div>
+    <p class="small muted">Armado para: ${ids.filter((i) => i !== 'base').map((i) => `${MODULES[i].icon} ${MODULES[i].label}`).join(' · ') || '🥾 Trekking de día'} · peso aprox. ${kg(weight)}</p>
   </section>
-
+  ${carry.length ? `<section class="card highlight"><h3>Te toca llevar para el grupo</h3><ul class="gear-list">${carry.map((g) => row({ ...g, reason: g.scope === 'c' ? `para ${myRope?.name || 'tu cordada'}` : 'para todos' })).join('')}</ul></section>` : ''}
+  ${wx.length ? `<section class="card"><h3>🌦️ Por el pronóstico</h3><ul class="gear-list">${wx.map(row).join('')}</ul></section>` : ''}
+  ${CATEGORIES.filter((c) => byCat[c]).map((c) => `<section class="card"><h3>${esc(c)}</h3><ul class="gear-list">${byCat[c].map(row).join('')}</ul></section>`).join('')}
   <section class="card">
-    <h3>Ruta</h3>
-    <div class="link-list">
-      ${trip.andesUrl ? `<a class="btn" href="${esc(trip.andesUrl)}" target="_blank" rel="noopener">📖 Ruta en Andeshandbook ↗</a>` : ''}
-      <a class="btn" href="${andesSearch(trip.peak || trip.name)}" target="_blank" rel="noopener">🔎 Buscar en Andeshandbook ↗</a>
-      <a class="btn" href="https://www.google.com/search?q=${encodeURIComponent(`wikiloc ${trip.peak || trip.name}`)}" target="_blank" rel="noopener">🥾 Tracks en Wikiloc ↗</a>
-      ${hasPos ? `<a class="btn" href="https://www.google.com/maps/search/?api=1&query=${trip.lat},${trip.lon}" target="_blank" rel="noopener">📍 Google Maps ↗</a>` : ''}
-    </div>
-    ${trip.notes ? `<p class="notes">${esc(trip.notes)}</p>` : ''}
-  </section>
-
-  <section class="card">
-    <div class="row between"><h3>Clima</h3><a href="#/salida/${trip.id}/clima">Ver pronóstico →</a></div>
-    ${alerts ? alertList(alerts) + `<p class="small muted">Actualizado ${new Date(trip.weather.fetchedAt).toLocaleString('es-CL')}</p>` : `<p class="muted">${hasPos ? 'Abre la pestaña Clima para descargar el pronóstico.' : 'Define la ubicación del objetivo para ver el pronóstico.'}</p>`}
-  </section>
-
-  <section class="card">
-    <div class="row between"><h3>Equipo por persona</h3><a href="#/salida/${trip.id}/equipo">Checklist →</a></div>
-    ${trip.members.length ? `<ul class="member-progress">${trip.members.map((m) => {
-      const mp = gearProgress(trip, m.id);
-      return `<li><span class="avatar">${esc(initials(m.name))}</span><span class="grow">${esc(m.name)}<span class="small muted"> · ${kg(w[m.id] || 0)}</span><div class="progress"><i style="width:${mp.pct}%"></i></div></span><b>${mp.pct}%</b></li>`;
-    }).join('')}</ul>` : `<p class="muted">Agrega a los integrantes en <a href="#/salida/${trip.id}/grupo">Grupo</a>.</p>`}
-  </section>
-
-  ${trip.members.length ? `<section class="card">
-    <div class="row between"><h3>Revisión de seguridad</h3><a href="#/salida/${trip.id}/grupo">Grupo →</a></div>
-    ${alertList(safetyChecks(trip))}
-  </section>` : ''}
-
-  <section class="card">
-    <h3>Compartir con el grupo</h3>
-    ${trip.syncId ? `<p class="small">🟢 <b>Sincronizada en tiempo real.</b> Cada integrante que se una ve los mismos checks, cordadas, autos y plan al instante, y puede trabajar sin señal: los cambios se envían al volver la conexión.</p>
-    <div class="link-list"><button class="btn primary" id="invite">👥 Invitar al grupo</button></div>`
-    : syncConfig() ? `<p class="small muted">Activa la sincronización para que todos vean los cambios al instante (checks, cordadas, autos, plan).</p>
-    <div class="link-list"><button class="btn primary" id="enable-sync">🔄 Activar sincronización</button></div>`
-    : '<p class="small muted">Sincronización en tiempo real: configúrala en <a href="#/ajustes">Ajustes</a>. Mientras tanto, comparte una copia con el link: quien lo abra la importa en su teléfono.</p>'}
-    <div class="link-list top-gap">
-      <button class="btn ${trip.syncId || syncConfig() ? '' : 'primary'}" id="share-link">🔗 Compartir copia</button>
-      <button class="btn" id="export">⬇️ Descargar JSON</button>
-      <button class="btn" id="print">🖨️ Imprimir checklist</button>
-      <button class="btn danger" id="delete">Eliminar salida</button>
-    </div>
+    <h3>Agregar algo mío</h3>
+    <form id="add-mine" class="row gap"><input name="name" class="grow" required placeholder="Ej: Cargador solar"><button class="btn" type="submit">Agregar</button></form>
+    ${Object.keys(detected).length ? '' : ''}
   </section>`;
 
-  $('#invite', el)?.addEventListener('click', () => shareOrCopy({ title: `Salida: ${trip.name}`, text: `Únete a la salida "${trip.name}" en Cordada:`, url: inviteUrl(trip) }));
-  $('#enable-sync', el)?.addEventListener('click', async (e) => {
-    e.target.disabled = true;
-    e.target.textContent = 'Activando…';
-    try {
-      await enableSync(trip);
-      toast('Sincronización activada');
-      renderTrip(trip, 'resumen');
-    } catch (err) {
-      alert(`No se pudo activar: ${err.message}`);
-      e.target.disabled = false;
-      e.target.textContent = '🔄 Activar sincronización';
-    }
-  });
-  $('#share-link', el).addEventListener('click', async () => {
-    const code = await encodeTrip(trip);
-    const url = `${location.origin}${location.pathname}#/importar/${code}`;
-    if (url.length > 60000) toast('La salida es muy grande para un link: usa "Descargar JSON".');
-    await shareOrCopy({ title: `Salida: ${trip.name}`, text: `Salida "${trip.name}" en Cordada`, url });
-  });
-  $('#export', el).addEventListener('click', () => download(`cordada-${slug(trip.name)}.json`, JSON.stringify(trip, null, 2)));
-  $('#print', el).addEventListener('click', () => { go(`#/salida/${trip.id}/equipo`); setTimeout(() => window.print(), 300); });
-  $('#delete', el).addEventListener('click', () => {
-    if (confirm(`¿Eliminar "${trip.name}" de este dispositivo?${trip.syncId ? ' (El resto del grupo la conserva.)' : ''}`)) {
-      if (trip.syncId) syncer?.unwatch(trip.syncId);
-      deleteTrip(trip.id);
-      go('#/');
-    }
+  el.onchange = (e) => {
+    const id = e.target.dataset.id;
+    if (!id) return;
+    const g = trip.gear.find((x) => x.id === id);
+    if (g.scope === 'p') g.checks = { ...(g.checks || {}), [myId]: e.target.checked };
+    else if (g.scope === 'c') g.checks = { ...(g.checks || {}), [ropeKey(myRope)]: e.target.checked };
+    else g.checked = e.target.checked;
+    save();
+    const y = window.scrollY;
+    tabMyGear(trip, el);
+    window.scrollTo(0, y);
+  };
+  el.onclick = (e) => {
+    const b = e.target.closest('[data-del]');
+    if (!b) return;
+    trip.gear = trip.gear.filter((g) => g.id !== b.dataset.del);
+    save();
+    tabMyGear(trip, el);
+  };
+  $('#add-mine', el).addEventListener('submit', (e) => {
+    e.preventDefault();
+    trip.gear.push({ id: uid(), name: e.target.name.value.trim(), cat: 'Otros', scope: 'p', weight: 0, checks: {}, mod: 'custom', owner: myId });
+    save();
+    tabMyGear(trip, el);
   });
 }
 
-async function shareOrCopy({ title, text, url }) {
+// --- Grupo: quién va, cordadas, autos y reparto (automático) ---
+function tabGroup(trip, el) {
+  const owner = isOwner(trip);
+  const going = trip.members.filter((m) => m.rsvp !== 'no');
+  const notGoing = trip.members.filter((m) => m.rsvp === 'no');
+  const name = (id) => trip.members.find((m) => m.id === id)?.name || '—';
+  const groupGear = trip.gear.filter((g) => g.scope === 'g');
+  const ropeGear = trip.gear.filter((g) => g.scope === 'c');
+  const ropes = ropesOf(trip);
+
+  el.innerHTML = `
+  ${owner ? `<section class="card callout">
+    <div class="row between wrap-row"><div><h3>${trip.manualOrg ? 'Organización manual' : 'Se organiza solo'}</h3>
+    <p class="small muted">${trip.manualOrg ? 'Cambiaste asignaciones a mano, así que la app ya no reorganiza sola.' : 'Cada vez que alguien confirma, la app arma las cordadas, reparte el equipo común equilibrando el peso y asigna los autos según los cupos de cada ficha.'}</p></div>
+    <button class="btn ${trip.manualOrg ? 'primary' : ''}" id="auto-org">⚡ ${trip.manualOrg ? 'Volver a automático' : 'Reorganizar ahora'}</button></div>
+  </section>
+  <section class="card"><h3>Revisión de seguridad</h3>${alertList(safetyChecks(trip))}</section>` : ''}
+
+  <section class="card">
+    <h3>Van (${going.length})</h3>
+    <ul class="members">${going.map((m) => {
+      const p = gearProgress(trip, m.id);
+      return `<li>
+        <span class="avatar">${esc(initials(m.name))}</span>
+        <div class="grow">
+          <b>${esc(m.name)}</b>${m.id === trip.ownerId ? ' <span class="pill accent">encargado/a</span>' : ''}${m.id === me(trip) ? ' <span class="pill">tú</span>' : ''}
+          <div class="tags">${m.firstAid ? `<span class="tag good">🩹 ${esc(m.firstAid)}</span>` : ''}${m.knowsRoute ? '<span class="tag good">🧭 conoce la ruta</span>' : ''}${Number(m.carSeats) > 0 ? `<span class="tag">🚗 ${m.carSeats} cupos</span>` : ''}${m.emergencyName || m.emergency ? '' : '<span class="tag warn">sin contacto de emergencia</span>'}</div>
+          <div class="progress"><i style="width:${p.pct}%"></i></div>
+          <div class="small muted">Equipo ${p.pct}%${m.phone ? ` · <a href="https://wa.me/${esc(waNumber(m.phone))}" target="_blank" rel="noopener">WhatsApp</a>` : ''}</div>
+        </div>
+        ${owner ? `<label class="small check"><input type="checkbox" data-knows="${m.id}" ${m.knowsRoute ? 'checked' : ''}>conoce ruta</label>` : ''}
+      </li>`;
+    }).join('')}</ul>
+    ${notGoing.length ? `<p class="small muted top-gap">No van: ${notGoing.map((m) => esc(m.name)).join(', ')}</p>` : ''}
+    ${owner ? `<details class="top-gap"><summary>Agregar a alguien sin la app</summary>
+      <form id="add-member" class="form top-gap">${FICHA_FIELDS.filter((f) => f[4]).map(([k, label, type]) => `<label>${label}<input name="${k}" type="${type}"></label>`).join('')}<button class="btn" type="submit">Agregar</button></form>
+    </details>` : ''}
+  </section>
+
+  ${trip.ropes.length ? `<section class="card"><h3>Cordadas</h3><ul class="ropes">${trip.ropes.map((r) => `<li><b>${esc(r.name)}</b><span class="grow small">${r.memberIds.map((id) => esc(name(id))).join(', ')}</span></li>`).join('')}</ul></section>` : ''}
+
+  ${trip.cars.length ? `<section class="card"><h3>Autos</h3><ul class="cars">${trip.cars.map((c) => `<li>
+    <div class="row between"><b>🚗 ${esc(name(c.driverId))}</b><span class="pill ${c.passengerIds.length > c.seats ? 'bad' : ''}">${c.passengerIds.length}/${c.seats}</span></div>
+    <div class="small muted">${c.from ? `Sale desde ${esc(c.from)}` : ''}</div>
+    <div class="small">${c.passengerIds.map((id) => esc(name(id))).join(', ') || 'Sin pasajeros'}</div></li>`).join('')}</ul></section>` : ''}
+
+  ${groupGear.length || ropeGear.length ? `<section class="card"><h3>Equipo común</h3>
+    <ul class="gear-list">${groupGear.map((g) => `<li class="gear ${g.checked ? 'done' : ''}"><span class="grow"><span class="gname">${esc(g.name)}</span></span>
+      ${owner ? `<select data-assign="${g.id}"><option value="">Sin asignar</option>${going.map((m) => `<option value="${m.id}" ${g.assignee === m.id ? 'selected' : ''}>${esc(firstName(m.name))}</option>`).join('')}</select>` : `<span class="small">${g.assignee ? esc(firstName(name(g.assignee))) : '<span class="muted">sin asignar</span>'}</span>`}</li>`).join('')}
+    ${ropeGear.map((g) => `<li class="gear"><span class="grow"><span class="gname">${esc(g.name)}</span><span class="small muted"> · una por cordada</span></span>
+      <span class="small">${ropes.map((r) => `${trip.ropes.length ? `${esc(ropeLabel(r))}: ` : ''}${g.carriers?.[r.id] ? esc(firstName(name(g.carriers[r.id]))) : '—'}${g.checks?.[ropeKey(r)] ? ' ✓' : ''}`).join(' · ')}</span></li>`).join('')}</ul>
+  </section>` : ''}`;
+
+  $('#auto-org', el)?.addEventListener('click', () => {
+    autoOrganize(trip, { force: true });
+    save();
+    tabGroup(trip, el);
+    toast('Grupo organizado');
+  });
+  $$('[data-knows]', el).forEach((c) => c.addEventListener('change', () => {
+    trip.members.find((m) => m.id === c.dataset.knows).knowsRoute = c.checked;
+    autoOrganize(trip);
+    save();
+    tabGroup(trip, el);
+  }));
+  $$('[data-assign]', el).forEach((s) => s.addEventListener('change', () => {
+    trip.gear.find((g) => g.id === s.dataset.assign).assignee = s.value;
+    trip.manualOrg = true;
+    save();
+  }));
+  $('#add-member', el)?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target));
+    trip.members.push({ ...memberFromProfile(f), rsvp: 'si' });
+    autoOrganize(trip);
+    save();
+    tabGroup(trip, el);
+  });
+}
+
+async function shareOrCopy({ title, text, url, whatsapp = false }) {
   if (navigator.share) {
     try { await navigator.share({ title, text, url }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  if (whatsapp) {
+    window.open(`https://wa.me/?text=${encodeURIComponent(`${text}\n${url || ''}`)}`, '_blank', 'noopener');
+    return;
   }
   try {
     await navigator.clipboard.writeText(url ? `${text}\n${url}` : text);
@@ -396,199 +773,9 @@ function alertList(alerts) {
   return `<ul class="alerts">${alerts.map((a) => `<li class="alert ${a.level}"><span>${icon[a.level]}</span>${esc(a.text)}</li>`).join('')}</ul>`;
 }
 
-// --- Grupo: integrantes, cordadas y autos ---
-const ROLES = ['', 'Jefe/a de salida', 'Primeros auxilios', 'Navegación', 'Comunicaciones', 'Cocina', 'Fotografía', 'Logística / transporte'];
-const FIRST_AID = ['', 'WFR', 'WAFA', 'Primeros auxilios básicos', 'Profesional de salud'];
+const firstName = (n) => String(n || '').split(/\s+/)[0];
+
 const memberName = (trip, id) => trip.members.find((m) => m.id === id)?.name || '—';
-const firstName = (name) => name.split(/\s+/)[0];
-
-function tabGroup(trip, el) {
-  const w = weightByMember(trip);
-  const leader = trip.org?.leaderId;
-  const inRope = new Set(trip.ropes.flatMap((r) => r.memberIds));
-  const inCar = new Set(trip.cars.flatMap((c) => [c.driverId, ...c.passengerIds]));
-  const memberOpts = (sel, exclude = []) => trip.members.filter((m) => !exclude.includes(m.id)).map((m) => `<option value="${m.id}" ${sel === m.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
-
-  el.innerHTML = `
-  <section class="card">
-    <h3>Integrantes (${trip.members.length})</h3>
-    ${trip.members.length ? `<ul class="members">${trip.members.map((m) => `
-      <li>
-        <span class="avatar">${esc(initials(m.name))}</span>
-        <div class="grow">
-          <b>${esc(m.name)}</b>${me(trip) === m.id ? ' <span class="pill">yo</span>' : ''}${leader === m.id ? ' <span class="pill accent">jefe/a de salida</span>' : ''}
-          <div class="small muted">${esc([m.role, m.age && `${m.age} años`, m.rut && `RUT ${m.rut}`].filter(Boolean).join(' · ') || 'Sin rol')} · carga ≈ ${kg(w[m.id] || 0)}</div>
-          <div class="tags">${m.firstAid ? `<span class="tag good">🩹 ${esc(m.firstAid)}</span>` : ''}${m.knowsRoute ? '<span class="tag good">🧭 conoce la ruta</span>' : ''}${m.emergencyName || m.emergency ? '' : '<span class="tag warn">sin contacto de emergencia</span>'}</div>
-          ${m.phone ? `<div class="small"><a href="tel:${esc(m.phone)}">📞 ${esc(m.phone)}</a> · <a href="https://wa.me/${esc(waNumber(m.phone))}" target="_blank" rel="noopener">WhatsApp</a></div>` : ''}
-          ${m.emergencyName || m.emergency ? `<div class="small">🆘 ${esc(emergencyOf(m))}</div>` : ''}
-          ${m.health ? `<div class="small">🩺 ${esc(m.health)}</div>` : ''}
-        </div>
-        <div class="col">
-          <button class="btn small" data-me="${m.id}">${me(trip) === m.id ? 'Soy yo ✓' : 'Soy yo'}</button>
-          <button class="btn small" data-edit="${m.id}">Editar</button>
-        </div>
-      </li>`).join('')}</ul>` : '<p class="muted">Aún no hay integrantes.</p>'}
-  </section>
-
-  <section class="card">
-    <h3 id="member-form-title">Agregar integrante</h3>
-    <form id="member-form" class="form">
-      <input type="hidden" name="id">
-      <div class="cols2">
-        <label>Nombre<input name="name" required></label>
-        <label>Teléfono<input name="phone" type="tel" placeholder="+56 9 ..."></label>
-        <label>RUT<input name="rut" placeholder="12.345.678-9"></label>
-        <label>Edad<input name="age" type="number" min="0" max="120"></label>
-        <label>Contacto de emergencia<input name="emergencyName" placeholder="Nombre"></label>
-        <label>Teléfono del contacto<input name="emergencyPhone" type="tel"></label>
-        <label>Rol<select name="role">${ROLES.map((r) => `<option>${esc(r)}</option>`).join('')}</select></label>
-        <label>Certificación primeros auxilios<select name="firstAid">${FIRST_AID.map((r) => `<option value="${esc(r)}">${esc(r || 'Ninguna')}</option>`).join('')}</select></label>
-      </div>
-      <label class="check"><input type="checkbox" name="knowsRoute"> Conoce el sector y la ruta</label>
-      <label>Salud relevante (alergias, medicamentos, grupo sanguíneo)<input name="health"></label>
-      <div class="row gap">
-        <button class="btn primary" type="submit">Guardar</button>
-        <button class="btn danger" type="button" id="del-member" hidden>Quitar de la salida</button>
-      </div>
-    </form>
-  </section>
-
-  <section class="card">
-    <h3>Cordadas</h3>
-    <p class="small muted">Divide al grupo en cordadas (por carpa o por cuerda). El equipo "por cordada" (carpa, cocinilla, cena…) se marca una vez por cada una.</p>
-    ${trip.ropes.length ? `<ul class="ropes">${trip.ropes.map((r) => `<li>
-      <div class="grow"><b>${esc(r.name)}</b><div class="small">${r.memberIds.map((id) => esc(memberName(trip, id))).join(', ') || '<span class="muted">sin integrantes</span>'}</div></div>
-      <button class="btn small" data-rope="${r.id}">Editar</button></li>`).join('')}</ul>` : ''}
-    ${trip.ropes.length && trip.members.some((m) => !inRope.has(m.id)) ? `<p class="alert warn">Sin cordada: ${trip.members.filter((m) => !inRope.has(m.id)).map((m) => esc(firstName(m.name))).join(', ')}</p>` : ''}
-    <form id="rope-form" class="form top-gap">
-      <input type="hidden" name="id">
-      <label>Nombre<input name="name" required placeholder="Cordada ${trip.ropes.length + 1}"></label>
-      <fieldset><legend>Integrantes</legend><div class="chips">${trip.members.map((m) => `<label class="chip"><input type="checkbox" name="memberIds" value="${m.id}">${esc(m.name)}</label>`).join('') || '<span class="muted small">Agrega integrantes primero</span>'}</div></fieldset>
-      <div class="row gap"><button class="btn" type="submit">Guardar cordada</button><button class="btn danger" type="button" id="del-rope" hidden>Eliminar</button></div>
-    </form>
-  </section>
-
-  <section class="card">
-    <h3>Autos</h3>
-    ${trip.cars.length ? `<ul class="cars">${trip.cars.map((c, i) => {
-      const used = c.passengerIds.length;
-      return `<li>
-        <div class="row between"><b>🚗 Auto ${i + 1} · ${esc(memberName(trip, c.driverId))}</b><span class="pill ${used > c.seats ? 'bad' : ''}">${used}/${c.seats} cupos</span></div>
-        <div class="small muted">${esc([c.from && `Sale desde ${c.from}`, c.time && `a las ${c.time}`, c.plate && `patente ${c.plate}`].filter(Boolean).join(' · '))}</div>
-        <div class="small">Pasajeros: ${c.passengerIds.map((id) => esc(memberName(trip, id))).join(', ') || '—'}</div>
-        <button class="btn small top-gap" data-car="${c.id}">Editar</button>
-      </li>`;
-    }).join('')}</ul>` : '<p class="small muted">Organiza quién maneja, desde dónde sale y quién va en cada auto.</p>'}
-    ${trip.cars.length && trip.members.some((m) => !inCar.has(m.id)) ? `<p class="alert warn">Sin auto: ${trip.members.filter((m) => !inCar.has(m.id)).map((m) => esc(firstName(m.name))).join(', ')}</p>` : ''}
-    <form id="car-form" class="form top-gap">
-      <input type="hidden" name="id">
-      <div class="cols2">
-        <label>Conductor/a<select name="driverId" required><option value="">Elegir…</option>${memberOpts()}</select></label>
-        <label>Cupos para pasajeros<input name="seats" type="number" min="0" max="12" value="4"></label>
-        <label>Sale desde<input name="from" placeholder="Ej: Metro Irarrázaval"></label>
-        <label>Hora<input name="time" type="time"></label>
-      </div>
-      <label>Patente / modelo (para el aviso)<input name="plate"></label>
-      <fieldset><legend>Pasajeros</legend><div class="chips">${trip.members.map((m) => `<label class="chip"><input type="checkbox" name="passengerIds" value="${m.id}">${esc(m.name)}</label>`).join('')}</div></fieldset>
-      <div class="row gap"><button class="btn" type="submit">Guardar auto</button><button class="btn danger" type="button" id="del-car" hidden>Eliminar</button></div>
-    </form>
-  </section>`;
-
-  const again = () => tabGroup(trip, el);
-  const form = $('#member-form', el);
-  $$('[data-me]', el).forEach((b) => b.addEventListener('click', () => {
-    state.settings.me = { ...(state.settings.me || {}), [trip.id]: b.dataset.me };
-    save();
-    again();
-  }));
-  $$('[data-edit]', el).forEach((b) => b.addEventListener('click', () => {
-    const m = trip.members.find((x) => x.id === b.dataset.edit);
-    ['id', 'name', 'phone', 'rut', 'age', 'role', 'firstAid', 'emergencyName', 'emergencyPhone', 'health'].forEach((k) => { form[k].value = m[k] || ''; });
-    if (!m.emergencyName && m.emergency) form.emergencyName.value = m.emergency;
-    form.knowsRoute.checked = !!m.knowsRoute;
-    $('#member-form-title', el).textContent = `Editar a ${m.name}`;
-    $('#del-member', el).hidden = false;
-    form.scrollIntoView({ behavior: 'smooth' });
-  }));
-  $('#del-member', el).addEventListener('click', () => {
-    const id = form.id.value;
-    if (!confirm('¿Quitar a este integrante?')) return;
-    trip.members = trip.members.filter((m) => m.id !== id);
-    trip.gear.forEach((g) => { if (g.assignee === id) g.assignee = ''; if (g.checks) delete g.checks[id]; });
-    trip.ropes.forEach((r) => { r.memberIds = r.memberIds.filter((x) => x !== id); });
-    trip.cars = trip.cars.filter((c) => c.driverId !== id);
-    trip.cars.forEach((c) => { c.passengerIds = c.passengerIds.filter((x) => x !== id); });
-    save();
-    again();
-  });
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const data = Object.fromEntries(new FormData(form));
-    data.knowsRoute = form.knowsRoute.checked;
-    delete data.emergency;
-    if (data.id) {
-      const m = trip.members.find((x) => x.id === data.id);
-      delete m.emergency;
-      Object.assign(m, data);
-    } else trip.members.push({ ...data, id: uid() });
-    save();
-    again();
-  });
-
-  // Cordadas
-  const rf = $('#rope-form', el);
-  $$('[data-rope]', el).forEach((b) => b.addEventListener('click', () => {
-    const r = trip.ropes.find((x) => x.id === b.dataset.rope);
-    rf.id.value = r.id;
-    rf.name.value = r.name;
-    $$('input[name=memberIds]', rf).forEach((c) => { c.checked = r.memberIds.includes(c.value); });
-    $('#del-rope', el).hidden = false;
-    rf.scrollIntoView({ behavior: 'smooth' });
-  }));
-  rf.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const memberIds = $$('input[name=memberIds]:checked', rf).map((c) => c.value);
-    // Cada integrante queda en una sola cordada.
-    trip.ropes.forEach((r) => { if (r.id !== rf.id.value) r.memberIds = r.memberIds.filter((id) => !memberIds.includes(id)); });
-    const existing = trip.ropes.find((r) => r.id === rf.id.value);
-    if (existing) Object.assign(existing, { name: rf.name.value.trim(), memberIds });
-    else trip.ropes.push({ id: uid(), name: rf.name.value.trim(), memberIds });
-    save();
-    again();
-  });
-  $('#del-rope', el).addEventListener('click', () => {
-    trip.ropes = trip.ropes.filter((r) => r.id !== rf.id.value);
-    save();
-    again();
-  });
-
-  // Autos
-  const cf = $('#car-form', el);
-  $$('[data-car]', el).forEach((b) => b.addEventListener('click', () => {
-    const c = trip.cars.find((x) => x.id === b.dataset.car);
-    ['id', 'driverId', 'seats', 'from', 'time', 'plate'].forEach((k) => { cf[k].value = c[k] ?? ''; });
-    $$('input[name=passengerIds]', cf).forEach((x) => { x.checked = c.passengerIds.includes(x.value); });
-    $('#del-car', el).hidden = false;
-    cf.scrollIntoView({ behavior: 'smooth' });
-  }));
-  cf.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const f = Object.fromEntries(new FormData(cf));
-    const passengerIds = $$('input[name=passengerIds]:checked', cf).map((c) => c.value).filter((id) => id !== f.driverId);
-    trip.cars.forEach((c) => { if (c.id !== f.id) c.passengerIds = c.passengerIds.filter((id) => !passengerIds.includes(id)); });
-    const car = { driverId: f.driverId, seats: Number(f.seats) || 0, from: f.from.trim(), time: f.time, plate: f.plate.trim(), passengerIds };
-    const existing = trip.cars.find((c) => c.id === f.id);
-    if (existing) Object.assign(existing, car);
-    else trip.cars.push({ id: uid(), ...car });
-    save();
-    again();
-  });
-  $('#del-car', el).addEventListener('click', () => {
-    trip.cars = trip.cars.filter((c) => c.id !== cf.id.value);
-    save();
-    again();
-  });
-}
 
 const waNumber = (phone) => {
   let d = String(phone).replace(/\D/g, '');
@@ -600,153 +787,27 @@ const emergencyOf = (m) => [m.emergencyName || m.emergency, m.emergencyPhone].fi
 // Revisión de seguridad a partir de los datos del grupo.
 function safetyChecks(trip) {
   const out = [];
-  const ms = trip.members;
+  const ms = trip.members.filter((m) => m.rsvp !== 'no');
   if (!ms.length) return out;
-  if (!trip.org?.leaderId) out.push({ level: 'warn', text: 'No hay jefe/a de salida definido (Plan y seguridad).' });
   if (!ms.some((m) => m.knowsRoute)) out.push({ level: 'warn', text: 'Nadie conoce el sector ni la ruta: lleven track GPX y reseña, y estudien la ruta antes.' });
   if (!ms.some((m) => m.firstAid)) out.push({ level: 'warn', text: 'Nadie tiene certificación de primeros auxilios en terreno (WFR/WAFA).' });
   const noEm = ms.filter((m) => !m.emergencyName && !m.emergency);
   if (noEm.length) out.push({ level: 'warn', text: `Sin contacto de emergencia: ${noEm.map((m) => firstName(m.name)).join(', ')}.` });
   if (trip.cars.length) {
     const inCar = new Set(trip.cars.flatMap((c) => [c.driverId, ...c.passengerIds]));
-    const noCar = ms.filter((m) => !inCar.has(m.id));
+    const noCar = ms.filter((m) => m.rsvp !== 'no').filter((m) => !inCar.has(m.id));
     if (noCar.length) out.push({ level: 'warn', text: `Sin auto asignado: ${noCar.map((m) => firstName(m.name)).join(', ')}.` });
     trip.cars.filter((c) => c.passengerIds.length > c.seats).forEach((c) => out.push({ level: 'danger', text: `El auto de ${firstName(memberName(trip, c.driverId))} lleva más pasajeros que cupos.` }));
   }
-  if (!trip.plan?.return && !trip.plan?.alarm) out.push({ level: 'info', text: 'Define la hora de regreso y la hora de alarma en Plan y seguridad.' });
+  if (!trip.plan?.return && !trip.plan?.alarm) out.push({ level: 'info', text: 'Define la hora de regreso y la hora de alarma en la pestaña Aviso.' });
   if (!out.length) out.push({ level: 'good', text: 'Grupo completo: jefe/a de salida, contactos de emergencia, primeros auxilios y ruta conocida.' });
   return out;
-}
-
-// --- Equipo ---
-function tabGear(trip, el) {
-  const myId = me(trip);
-  const filter = ui.filter === 'me' && !myId ? 'all' : ui.filter;
-  const members = trip.members;
-  const p = gearProgress(trip, filter === 'me' ? myId : null);
-  const byCat = {};
-  trip.gear.forEach((g) => { (byCat[g.cat] ||= []).push(g); });
-  const cats = [...CATEGORIES, ...Object.keys(byCat).filter((c) => !CATEGORIES.includes(c))].filter((c) => byCat[c]);
-  const personalFor = filter === 'me' ? members.filter((m) => m.id === myId) : members;
-  const ropesFor = filter === 'me' ? ropesOf(trip).filter((r) => r.memberIds.includes(myId)) : ropesOf(trip);
-  const multiRope = trip.ropes.length > 0;
-
-  const row = (g) => {
-    if (filter === 'me' && g.scope === 'g' && g.assignee !== myId) return '';
-    if (g.scope === 'c') {
-      const done = ropesFor.length > 0 && ropesFor.every((r) => g.checks?.[ropeKey(r)]);
-      const controls = multiRope
-        ? `<div class="checks">${ropesFor.map((r) => `<button class="mchk rope ${g.checks?.[ropeKey(r)] ? 'on' : ''}" data-chk="${g.id}" data-m="${ropeKey(r)}" title="${esc(r.name)}" aria-pressed="${!!g.checks?.[ropeKey(r)]}">${esc(ropeLabel(r))}</button>`).join('')}</div>`
-        : `<input type="checkbox" data-chk="${g.id}" data-m="${ropeKey(ropesFor[0] || { id: 'all' })}" ${g.checks?.r_all ? 'checked' : ''} aria-label="Listo">`;
-      return `<li class="gear ${done ? 'done' : ''}">
-      <div class="grow"><span class="gname">${esc(g.name)}</span>
-        <span class="small muted"> · por cordada${g.weight ? ` · ${g.weight} g` : ''}</span></div>
-      ${controls}
-      <button class="icon-btn small no-print" data-del="${g.id}" aria-label="Eliminar ítem">×</button>
-    </li>`;
-    }
-    const done = g.scope === 'p'
-      ? (personalFor.length ? personalFor.every((m) => g.checks?.[m.id]) : !!g.checks?._)
-      : g.checked;
-    const controls = g.scope === 'p'
-      ? (personalFor.length
-        ? `<div class="checks">${personalFor.map((m) => `<button class="mchk ${g.checks?.[m.id] ? 'on' : ''}" data-chk="${g.id}" data-m="${m.id}" title="${esc(m.name)}" aria-pressed="${!!g.checks?.[m.id]}">${esc(initials(m.name))}</button>`).join('')}</div>`
-        : `<input type="checkbox" data-chk="${g.id}" data-m="_" ${g.checks?._ ? 'checked' : ''} aria-label="Listo">`)
-      : `<div class="row gap-s"><select data-assign="${g.id}" aria-label="Quién lo lleva"><option value="">¿Quién lo lleva?</option>${members.map((m) => `<option value="${m.id}" ${g.assignee === m.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select><input type="checkbox" data-gchk="${g.id}" ${g.checked ? 'checked' : ''} aria-label="Listo"></div>`;
-    return `<li class="gear ${done ? 'done' : ''}">
-      <div class="grow"><span class="gname">${esc(g.name)}</span>
-        <span class="small muted"> ${g.scope === 'g' ? '· grupal' : '· personal'}${g.weight ? ` · ${g.weight} g` : ''}</span></div>
-      ${controls}
-      <button class="icon-btn small no-print" data-del="${g.id}" aria-label="Eliminar ítem">×</button>
-    </li>`;
-  };
-
-  el.innerHTML = `
-  <section class="card sticky-summary">
-    <div class="row between wrap-row">
-      <div class="seg" role="group">
-        <button class="${filter === 'all' ? 'on' : ''}" data-filter="all">Todo el grupo</button>
-        <button class="${filter === 'me' ? 'on' : ''}" data-filter="me" ${myId ? '' : 'disabled title="Elige quién eres en Cordada"'}>Lo mío</button>
-      </div>
-      <b>${p.done}/${p.total} · ${p.pct}%</b>
-    </div>
-    <div class="progress big"><i style="width:${p.pct}%"></i></div>
-  </section>
-  ${members.length ? '' : '<p class="small muted">Tip: agrega integrantes en Grupo para marcar el equipo personal de cada uno y repartir el grupal.</p>'}
-  ${multiRope ? '<p class="small muted">Personal: iniciales de cada integrante · Por cordada: C1, C2… · Grupal: se asigna quién lo lleva.</p>' : ''}
-  ${cats.map((c) => {
-    const rows = byCat[c].map(row).join('');
-    return rows ? `<section class="card"><h3>${esc(c)}</h3><ul class="gear-list">${rows}</ul></section>` : '';
-  }).join('')}
-  <section class="card no-print">
-    <h3>Agregar ítem</h3>
-    <form id="gear-form" class="form">
-      <label>Ítem<input name="name" required placeholder="Ej: Radio portátil"></label>
-      <div class="cols3">
-        <label>Categoría<select name="cat">${CATEGORIES.map((c) => `<option>${esc(c)}</option>`).join('')}</select></label>
-        <label>Tipo<select name="scope"><option value="p">Personal (cada uno)</option><option value="c">Por cordada (uno por cordada)</option><option value="g">Grupal (uno para todos)</option></select></label>
-        <label>Peso (g)<input name="weight" type="number" min="0"></label>
-      </div>
-      <button class="btn primary" type="submit">Agregar</button>
-    </form>
-    <div class="row gap wrap-row top-gap">
-      <select id="add-mod"><option value="">＋ Agregar equipo de otra actividad…</option>${Object.entries(MODULES).filter(([id]) => !trip.modules.includes(id)).map(([id, m]) => `<option value="${id}">${m.icon} ${m.label}</option>`).join('')}</select>
-      <button class="btn" id="reset-checks">Desmarcar todo</button>
-      <button class="btn" id="print-gear">🖨️ Imprimir</button>
-    </div>
-  </section>`;
-
-  const rerender = () => { const y = window.scrollY; tabGear(trip, el); window.scrollTo(0, y); };
-  el.onclick = (e) => {
-    const t = e.target.closest('[data-filter],[data-del],button[data-chk]');
-    if (!t) return;
-    if (t.dataset.filter) { ui.filter = t.dataset.filter; return rerender(); }
-    if (t.dataset.del) {
-      const g = trip.gear.find((x) => x.id === t.dataset.del);
-      if (confirm(`¿Quitar "${g.name}" de la lista?`)) { trip.gear = trip.gear.filter((x) => x !== g); save(); rerender(); }
-      return;
-    }
-    const g = trip.gear.find((x) => x.id === t.dataset.chk);
-    g.checks = { ...(g.checks || {}), [t.dataset.m]: !g.checks?.[t.dataset.m] };
-    save();
-    rerender();
-  };
-  el.onchange = (e) => {
-    const t = e.target;
-    if (t.dataset.chk) {
-      const g = trip.gear.find((x) => x.id === t.dataset.chk);
-      g.checks = { ...(g.checks || {}), _: t.checked };
-    } else if (t.dataset.gchk) {
-      trip.gear.find((x) => x.id === t.dataset.gchk).checked = t.checked;
-    } else if (t.dataset.assign) {
-      trip.gear.find((x) => x.id === t.dataset.assign).assignee = t.value;
-    } else if (t.id === 'add-mod' && t.value) {
-      addModules(trip, [t.value]);
-      toast(`Agregado: ${MODULES[t.value].label}`);
-    } else return;
-    save();
-    rerender();
-  };
-  $('#gear-form', el).addEventListener('submit', (e) => {
-    e.preventDefault();
-    const f = Object.fromEntries(new FormData(e.target));
-    trip.gear.push(makeItem(f.name.trim(), f.cat, f.scope, Number(f.weight) || 0));
-    save();
-    rerender();
-  });
-  $('#reset-checks', el).addEventListener('click', () => {
-    if (!confirm('¿Desmarcar todo el equipo?')) return;
-    trip.gear.forEach((g) => { g.checked = false; g.checks = {}; });
-    save();
-    rerender();
-  });
-  $('#print-gear', el).addEventListener('click', () => window.print());
 }
 
 // --- Clima ---
 function tabWeather(trip, el) {
   if (trip.lat == null) {
-    el.innerHTML = `<section class="card"><p>Para ver el pronóstico, define la ubicación del objetivo en <a href="#/salida/${trip.id}/editar">Editar</a> o en el <a href="#/salida/${trip.id}/mapa">Mapa</a>.</p></section>`;
+    el.innerHTML = '<section class="card"><p>La salida no tiene ubicación.</p></section>';
     return;
   }
   const w = trip.weather;
@@ -774,7 +835,7 @@ function tabWeather(trip, el) {
     st.innerHTML = '<p class="muted">Descargando pronóstico…</p>';
     try {
       trip.weather = await fetchWeather(trip);
-      save();
+      if (canAuto(trip)) { syncGear(trip); save(); } else saveLocal();
       tabWeather(trip, el);
     } catch (err) {
       st.innerHTML = `<p class="alert warn">No se pudo actualizar (${esc(err.message)}). ${trip.weather ? 'Mostrando el último pronóstico guardado.' : ''}</p>`;
@@ -885,15 +946,16 @@ function tabMap(trip, el) {
   <section class="card map-card">
     <div id="map" class="map"></div>
     <div class="row gap wrap-row top-gap">
-      <button class="btn" id="pick">📍 Fijar objetivo en el mapa</button>
+      ${isOwner(trip) ? '<button class="btn" id="pick">📍 Corregir cumbre</button>' : ''}
       <button class="btn" id="locate">🎯 Mi ubicación</button>
-      <label class="btn">🗂️ Cargar GPX<input type="file" id="gpx-file" accept=".gpx,application/gpx+xml" hidden></label>
-      ${trip.gpx ? '<button class="btn" id="gpx-dl">⬇️ Descargar GPX</button><button class="btn danger" id="gpx-del">Quitar track</button>' : ''}
+      ${isOwner(trip) || !trip.syncId ? '<label class="btn">🗂️ Cargar mi GPX<input type="file" id="gpx-file" accept=".gpx,application/gpx+xml" hidden></label>' : ''}
+      ${trip.gpx ? '<button class="btn" id="gpx-dl">⬇️ Descargar GPX</button>' : ''}
     </div>
     <p class="small muted" id="coords">${trip.lat != null ? `Objetivo: ${trip.lat.toFixed(5)}, ${trip.lon.toFixed(5)} · ${toDMS(trip.lat, 'N', 'S')} ${toDMS(trip.lon, 'E', 'O')}` : 'Sin objetivo fijado.'}</p>
   </section>
   ${s ? `<section class="card">
-    <h3>Track: ${esc(trip.gpx.name || 'sin nombre')}</h3>
+    <h3>${esc(trip.gpx.name || 'Track')}</h3>
+    ${trip.gpx.auto ? '<p class="small muted">Calculada automáticamente. Si tienes el track real (Andeshandbook, Wikiloc), cárgalo y reemplaza este.</p>' : ''}
     <dl class="stats">
       <div><dt>Distancia</dt><dd>${s.distKm.toFixed(1)} km</dd></div>
       <div><dt>Desnivel +</dt><dd>${s.up} m</dd></div>
@@ -904,14 +966,17 @@ function tabMap(trip, el) {
     <p class="small muted">Tiempo según regla de Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos. En altura y con nieve, suma bastante más.</p>
     <div id="profile"></div>
     ${s.high ? '<button class="btn small top-gap" id="use-high">Usar el punto más alto como objetivo</button>' : ''}
-  </section>` : `<section class="card"><p class="muted">Carga el track GPX de la ruta (Andeshandbook, Wikiloc, tu GPS) para verlo en el mapa con su perfil de elevación. Se guarda en la salida y se comparte con la cordada.</p></section>`}`;
+  </section>` : `<section class="card"><p class="muted">${trip.info?.surroundAt ? 'No se encontró un camino cercano para calcular la ruta. Carga el track GPX (Andeshandbook, Wikiloc, tu GPS).' : 'Calculando la ruta…'}</p></section>`}`;
 
   const setTarget = (lat, lon, altitude) => {
     trip.lat = +lat.toFixed(6);
     trip.lon = +lon.toFixed(6);
     if (altitude != null) trip.altitude = Math.round(altitude);
     delete trip.weather;
+    if (trip.info) delete trip.info.surroundAt;
+    if (trip.gpx?.auto) trip.gpx = null;
     save();
+    enrich(trip);
     $('#coords', el).textContent = `Objetivo: ${trip.lat.toFixed(5)}, ${trip.lon.toFixed(5)} · ${toDMS(trip.lat, 'N', 'S')} ${toDMS(trip.lon, 'E', 'O')}`;
     toast('Objetivo actualizado');
   };
@@ -920,7 +985,7 @@ function tabMap(trip, el) {
   let hoverMarker = null;
   if (ctrl && trip.gpx) drawTrack(ctrl, trip.gpx);
 
-  $('#pick', el).addEventListener('click', () => { ctrl?.pickMode(true); toast('Toca el mapa para fijar el objetivo'); });
+  $('#pick', el)?.addEventListener('click', () => { ctrl?.pickMode(true); toast('Toca el mapa para fijar el objetivo'); });
   $('#locate', el).addEventListener('click', () => {
     if (!navigator.geolocation) return toast('Tu navegador no entrega ubicación');
     navigator.geolocation.getCurrentPosition((pos) => {
@@ -933,12 +998,12 @@ function tabMap(trip, el) {
       toast(`Tu posición: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}${altitude ? ` · ${Math.round(altitude)} m` : ''}`);
     }, (err) => toast(`Sin ubicación: ${err.message}`), { enableHighAccuracy: true, timeout: 15000 });
   });
-  $('#gpx-file', el).addEventListener('change', async (e) => {
+  $('#gpx-file', el)?.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     try {
       const g = parseGPX(await file.text());
-      trip.gpx = { name: g.name || file.name.replace(/\.gpx$/i, ''), pts: g.pts, wpts: g.wpts, stats: g.stats, raw: null };
+      trip.gpx = { name: g.name || file.name.replace(/\.gpx$/i, ''), pts: g.pts, wpts: g.wpts, stats: g.stats };
       // Se guarda una versión liviana de los puntos (máx. ~3000) para no llenar el almacenamiento.
       const step = Math.ceil(g.pts.length / 3000);
       trip.gpx.pts = g.pts.filter((_, i) => i % step === 0 || i === g.pts.length - 1).map((p) => ({ lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), ele: p.ele == null ? null : Math.round(p.ele) }));
@@ -988,7 +1053,7 @@ ${g.pts.map((p) => pt(p, 'trkpt')).join('\n')}
 
 // --- Fotos ---
 function tabPhotos(trip, el) {
-  const clientId = state.settings.googleClientId;
+  const clientId = DRIVE_CLIENT_ID;
   const folder = trip.drive?.folderId;
   const folderUrl = trip.drive?.folderUrl;
   el.innerHTML = `
@@ -1002,7 +1067,7 @@ function tabPhotos(trip, el) {
         ${drive.isConnected() && !folder ? '<button class="btn primary" id="mkfolder">Crear carpeta de la salida</button>' : ''}
         ${drive.isConnected() && folder ? '<button class="btn" id="share-folder">Permitir que la cordada suba fotos</button><button class="btn" id="list">↻ Ver fotos</button>' : ''}
       </div>` : `
-      <p class="small muted">Para subir directo desde la app, configura un Client ID de Google en <a href="#/ajustes">Ajustes</a>. Mientras tanto, pega el link de una carpeta compartida de Drive y usa "Enviar a Drive" desde el teléfono.</p>`}
+      <p class="small muted">Pega el link de una carpeta compartida de Drive y usa "Enviar a Drive" desde el teléfono.</p>`}
     <form id="folder-form" class="row gap top-gap">
       <input name="url" type="url" placeholder="https://drive.google.com/drive/folders/..." value="${esc(folderUrl || '')}" class="grow">
       <button class="btn" type="submit">Guardar link</button>
@@ -1035,7 +1100,7 @@ function tabPhotos(trip, el) {
   });
   $('#mkfolder', el)?.addEventListener('click', async () => {
     try {
-      const f = await drive.createFolder(`Cordada · ${trip.name}${trip.date ? ` · ${trip.date}` : ''}`, state.settings.driveParent || undefined);
+      const f = await drive.createFolder(`Cordada · ${trip.name}${trip.date ? ` · ${trip.date}` : ''}`, undefined);
       trip.drive = { folderId: f.id, folderUrl: f.webViewLink };
       save();
       toast('Carpeta creada en tu Drive');
@@ -1149,8 +1214,9 @@ function planText(trip) {
     trip.peak && `Cerro / sector: ${trip.peak}${trip.altitude ? ` (${trip.altitude} m)` : ''}`,
     p.activityType && `Actividad: ${p.activityType}`,
     trip.lat != null && `Coordenadas: ${trip.lat.toFixed(5)}, ${trip.lon.toFixed(5)} https://www.google.com/maps?q=${trip.lat},${trip.lon}`,
-    p.start && `Acceso: ${p.start}`,
-    p.route && `Ruta: ${p.route}`,
+    (p.start || trip.info?.start?.name) && `Acceso: ${p.start || trip.info.start.name}${trip.info?.start ? ` (https://www.google.com/maps?q=${trip.info.start.lat},${trip.info.start.lon})` : ''}`,
+    trip.gpx?.stats && `Ruta: ${trip.gpx.stats.distKm.toFixed(1)} km ida, ${trip.gpx.stats.up} m de desnivel`,
+    p.route && `Ruta escogida: ${p.route}`,
     trip.andesUrl && `Reseña: ${trip.andesUrl}`,
     p.departure && `Salida: ${dt(p.departure)}`,
     p.turnaround && `Hora límite de cumbre: ${p.turnaround}`,
@@ -1170,6 +1236,8 @@ function planText(trip) {
 function tabPlan(trip, el) {
   const p = trip.plan;
   const o = trip.org;
+  // Datos del club por defecto (Mi ficha → Club).
+  Object.entries(state.settings.club || {}).forEach(([k, v]) => { if (!o[k] && v) o[k] = v; });
   const field = (obj, group) => ([k, label, type, ph]) => (type === 'textarea'
     ? `<label>${label}<textarea data-group="${group}" name="${k}" rows="2" placeholder="${esc(ph || '')}">${esc(obj[k])}</textarea></label>`
     : `<label>${label}<input data-group="${group}" name="${k}" type="${type}" value="${esc(obj[k])}" placeholder="${esc(ph || '')}"></label>`);
@@ -1308,18 +1376,9 @@ function applyRemote(syncId, data) {
   const keep = { id: trip.id, syncId, weather: trip.weather, createdAt: trip.createdAt };
   Object.keys(trip).forEach((k) => { if (!(k in data) && !(k in keep)) delete trip[k]; });
   Object.assign(trip, normalize({ ...data }), keep);
-  saveLocal();
-  // Refresca la vista si se está mirando esta salida y nadie está escribiendo.
-  const typing = document.activeElement?.matches?.('input, textarea, select');
-  if (location.hash.startsWith(`#/salida/${trip.id}/`) && !location.hash.endsWith('/editar') && !location.hash.endsWith('/mapa') && !typing) {
-    const y = window.scrollY;
-    const tab = location.hash.split('/')[3];
-    const el = $('#tab');
-    if (el) {
-      ({ resumen: tabSummary, grupo: tabGroup, equipo: tabGear, fotos: tabPhotos, plan: tabPlan })[tab]?.(trip, el);
-      window.scrollTo(0, y);
-    }
-  }
+  // El encargado reorganiza cuando alguien se suma o cambia su respuesta.
+  if (isOwner(trip) && autoOrganize(trip)) save(); else saveLocal();
+  if (location.hash.startsWith(`#/salida/${trip.id}/`)) rerenderTab(trip);
 }
 
 hooks.afterSave = () => {
@@ -1346,7 +1405,7 @@ async function renderJoin(syncId) {
   if (existing) return go(`#/salida/${existing.id}/resumen`);
   const s = getSyncer();
   if (!s) {
-    box.innerHTML = '<p class="alert warn">Esta instalación de Cordada no tiene la sincronización configurada. Pide a quien te invitó el link de la app correcto, o usa "Compartir link" para importar una copia.</p>';
+    box.innerHTML = '<p class="alert warn">Esta versión de la app no tiene la sincronización activa. Pide a quien te invitó que te reenvíe el link.</p>';
     return;
   }
   try {
@@ -1354,136 +1413,98 @@ async function renderJoin(syncId) {
     if (!data) throw new Error('La salida no existe o fue eliminada');
     box.innerHTML = `<h2>${esc(data.name)}</h2>
       <p class="muted">${esc(data.peak || '')}${data.date ? ` · ${fmtDate(data.date)}` : ''} · ${data.members.length} integrantes</p>
-      <p class="small">Los cambios de equipo, grupo y plan se verán en todos los teléfonos al instante.</p>
-      <button class="btn primary" id="do-join">Unirme</button>`;
+      <button class="btn primary" id="do-join">Ver la salida</button>`;
     $('#do-join').addEventListener('click', async () => {
       const trip = normalize({ ...data, id: uid(), syncId, createdAt: new Date().toISOString() });
       state.trips.unshift(trip);
       saveLocal();
       await s.watch(syncId);
-      history.replaceState(null, '', `#/salida/${trip.id}/grupo`);
+      history.replaceState(null, '', `#/salida/${trip.id}/salida`);
       route();
-      toast('¡Listo! Marca "Soy yo" en tu nombre o agrégate.');
     });
   } catch (err) {
     box.innerHTML = `<p class="alert warn">No se pudo abrir la salida (${esc(err.message)}).</p>`;
   }
 }
 
-// ---------- Importar desde link ----------
+// ---------- Abrir una invitación (copia en el link) ----------
 async function renderImport(code) {
-  view.innerHTML = `${header('Importar salida', { back: '#/' })}<main class="wrap narrow"><section class="card" id="imp"><p class="muted">Leyendo salida…</p></section></main>`;
+  view.innerHTML = `${header('Invitación', { back: '#/' })}<main class="wrap narrow"><section class="card" id="imp"><p class="muted">Abriendo la salida…</p></section></main>`;
   const box = $('#imp');
   try {
     const data = await decodeTrip(code);
-    const exists = getTrip(data.id);
-    box.innerHTML = `<h2>${esc(data.name)}</h2>
-      <p class="muted">${esc(data.peak || '')}${data.date ? ` · ${fmtDate(data.date)}` : ''} · ${data.members?.length || 0} integrantes · ${data.gear?.length || 0} ítems de equipo</p>
-      ${exists ? '<p class="alert warn">Ya tienes esta salida: se actualizará con la versión del link.</p>' : ''}
-      <button class="btn primary" id="do-import">${exists ? 'Actualizar salida' : 'Agregar a mis salidas'}</button>`;
-    $('#do-import').addEventListener('click', () => {
-      const t = importTrip(data);
-      if (t.syncId && getSyncer()) syncer.watch(t.syncId).catch(() => {});
-      history.replaceState(null, '', `#/salida/${t.id}/grupo`);
-      route();
-      toast('Salida importada. Marca quién eres en el grupo.');
-    });
+    const trip = importTrip(data);
+    history.replaceState(null, '', `#/salida/${trip.id}/salida`);
+    route();
   } catch (err) {
-    box.innerHTML = `<p class="alert warn">El link no es válido o está incompleto (${esc(err.message)}).</p>`;
+    box.innerHTML = `<p class="alert warn">El link no es válido o está incompleto (${esc(err.message)}). Pide que te lo reenvíen.</p>`;
   }
 }
 
-// ---------- Ajustes ----------
+// ---------- Mi ficha y ajustes ----------
 function renderSettings() {
-  const s = state.settings;
-  const club = s.club || {};
-  view.innerHTML = `${header('Ajustes', { back: '#/' })}
+  const p = profile() || {};
+  const club = state.settings.club || {};
+  view.innerHTML = `${header('Mi ficha', { back: '#/' })}
   <main class="wrap narrow">
     <section class="card">
-      <h3>Datos del club</h3>
-      <p class="small muted">Se copian a cada salida nueva (puedes cambiarlos en Plan y seguridad).</p>
+      <h2>Mi ficha</h2>
+      <p class="small muted">Se guarda solo en este teléfono y se comparte con el grupo de cada salida a la que vas (para el aviso de salida y emergencias).</p>
+      <form id="ficha" class="form">
+        ${fichaForm(p)}
+        <button class="btn primary" type="submit">Guardar mi ficha</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>Club (para el aviso de salida)</h2>
+      <p class="small muted">Si organizas salidas de un club, estos datos se agregan solos al aviso.</p>
       <form id="club-form" class="form">
         ${ORG_FIELDS.map(([k, label, type, ph]) => `<label>${label}<input name="${k}" type="${type}" value="${esc(club[k])}" placeholder="${esc(ph || '')}"></label>`).join('')}
-        <button class="btn primary" type="submit">Guardar</button>
+        <button class="btn" type="submit">Guardar club</button>
       </form>
     </section>
     <section class="card">
-      <h3>Sincronización en tiempo real</h3>
-      <p class="small">${FIREBASE_CONFIG ? '✅ Esta instalación ya trae Firebase configurado.' : syncConfig() ? '✅ Firebase configurado en este dispositivo.' : 'Sin configurar: las salidas se comparten como copia (link o JSON).'}</p>
-      <form id="sync-form" class="form">
-        <label>Configuración de Firebase (pega el bloque <code>firebaseConfig</code>)<textarea name="firebaseConfig" rows="5" placeholder='{ apiKey: "...", authDomain: "...", projectId: "...", appId: "..." }'>${esc(typeof s.firebaseConfig === 'string' ? s.firebaseConfig : '')}</textarea></label>
-        <button class="btn primary" type="submit">Guardar</button>
-      </form>
-      <details class="top-gap"><summary>¿Cómo se configura? (una sola vez, gratis)</summary>
-        <ol class="small">
-          <li>Entra a <a href="https://console.firebase.google.com/" target="_blank" rel="noopener">Firebase Console</a> → Crear proyecto (plan gratuito Spark).</li>
-          <li><b>Authentication</b> → Comenzar → habilita el proveedor <b>Anónimo</b>.</li>
-          <li><b>Firestore Database</b> → Crear base de datos (región <code>southamerica-west1</code>, Santiago) → en <b>Reglas</b> pega el contenido de <code>firestore.rules</code> del repositorio.</li>
-          <li>Configuración del proyecto → Tus apps → <b>Web</b> → registra la app y copia el bloque <code>firebaseConfig</code>.</li>
-          <li>Lo ideal: pégalo en <code>js/config.js</code> antes de publicar, así toda la cordada lo tiene. Para probar, pégalo aquí.</li>
-          <li>En Authentication → Configuración → Dominios autorizados, agrega el dominio donde publicaste la app.</li>
-        </ol>
-      </details>
-    </section>
-    <section class="card">
-      <h3>Google Drive</h3>
-      <form id="settings-form" class="form">
-        <label>OAuth Client ID (aplicación web)<input name="googleClientId" value="${esc(s.googleClientId || '')}" placeholder="1234-abc.apps.googleusercontent.com"></label>
-        <label>ID de carpeta madre en Drive (opcional)<input name="driveParent" value="${esc(s.driveParent || '')}" placeholder="Si lo dejas vacío, se crea en Mi unidad"></label>
-        <button class="btn primary" type="submit">Guardar</button>
-      </form>
-      <details class="top-gap"><summary>¿Cómo obtengo el Client ID?</summary>
-        <ol class="small">
-          <li>Entra a <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a> (puede ser el mismo proyecto de Firebase).</li>
-          <li>Habilita la <b>Google Drive API</b>.</li>
-          <li>En "Pantalla de consentimiento OAuth" configura la app (tipo Externo) y agrega a tu cordada como usuarios de prueba.</li>
-          <li>En Credenciales → Crear → ID de cliente OAuth → <b>Aplicación web</b>. En "Orígenes autorizados de JavaScript" agrega la URL donde publicaste la app (ej. <code>${esc(location.origin)}</code>).</li>
-          <li>Copia el Client ID aquí. La app solo pide permiso <code>drive.file</code>: ve únicamente lo que ella misma crea.</li>
-        </ol>
-      </details>
-    </section>
-    <section class="card">
-      <h3>Datos</h3>
-      <p class="small muted">Las salidas se guardan en este dispositivo (y en Firebase las que sincronizas). Respalda de vez en cuando.</p>
+      <h2>Respaldo</h2>
       <div class="link-list">
-        <button class="btn" id="export-all">⬇️ Exportar todas las salidas</button>
-        <label class="btn">⬆️ Importar respaldo<input type="file" accept=".json" id="import-all" hidden></label>
-        <button class="btn danger" id="wipe">Borrar todo</button>
+        <button class="btn" id="export-all">Exportar mis salidas</button>
+        <label class="btn">Importar respaldo<input type="file" accept=".json" id="import-all" hidden></label>
       </div>
+      <p class="small muted top-gap">${getSyncer() ? '🟢 Sincronización en tiempo real activa.' : 'Sin sincronización: cada teléfono guarda su copia y las confirmaciones llegan por WhatsApp.'}</p>
     </section>
-    <section class="card small muted">
-      <p>Cordada · pronóstico <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0) · mapas © OpenStreetMap, OpenTopoMap, Esri · búsqueda GeoNames.</p>
-      <p>El pronóstico es una ayuda y no reemplaza tu criterio en montaña.</p>
-    </section>
+    <p class="small muted center">Datos: OpenStreetMap, Wikidata, Wikipedia, Open-Meteo (CC BY 4.0), BRouter. El pronóstico y las rutas calculadas son una ayuda y no reemplazan tu criterio en montaña.</p>
   </main>`;
+  $('#ficha').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const prof = readFicha(e.target);
+    state.settings.profile = prof;
+    // Actualiza mis datos en las salidas donde participo.
+    state.trips.forEach((t) => {
+      const m = t.members.find((x) => x.id === me(t));
+      if (m) Object.assign(m, memberFromProfile(prof), { id: m.id, rsvp: m.rsvp, knowsRoute: m.knowsRoute });
+    });
+    save();
+    toast('Ficha guardada');
+    go('#/');
+  });
   $('#club-form').addEventListener('submit', (e) => {
     e.preventDefault();
     state.settings.club = Object.fromEntries([...new FormData(e.target)].map(([k, v]) => [k, v.trim()]));
     save();
     toast('Datos del club guardados');
   });
-  $('#sync-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const text = e.target.firebaseConfig.value.trim();
-    if (text && !parseConfig(text)) return alert('No reconozco esa configuración. Debe incluir al menos apiKey y projectId.');
-    state.settings.firebaseConfig = text;
-    save();
-    toast(text ? 'Firebase configurado' : 'Sincronización desactivada');
-    setTimeout(() => location.reload(), 600);
-  });
-  $('#settings-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    Object.assign(state.settings, Object.fromEntries([...new FormData(e.target)].map(([k, v]) => [k, v.trim()])));
-    save();
-    toast('Ajustes guardados');
-  });
-  $('#export-all').addEventListener('click', () => download(`cordada-respaldo-${todayStr()}.json`, JSON.stringify({ trips: state.trips }, null, 2)));
-  $('#import-all').addEventListener('change', importFromFile);
-  $('#wipe').addEventListener('click', () => {
-    if (confirm('¿Borrar todas las salidas de este dispositivo? No se puede deshacer.')) {
-      state.trips = [];
+  $('#export-all').addEventListener('click', () => download(`cordada-respaldo-${todayStr()}.json`, JSON.stringify({ trips: state.trips, profile: state.settings.profile }, null, 2)));
+  $('#import-all').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      (data.trips || [data]).forEach(importTrip);
+      if (data.profile && !profile()) state.settings.profile = data.profile;
       save();
+      toast('Respaldo importado');
       go('#/');
+    } catch (err) {
+      alert(`No se pudo importar: ${err.message}`);
     }
   });
 }

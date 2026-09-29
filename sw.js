@@ -1,8 +1,8 @@
 // Service worker: la app funciona sin señal en la montaña.
-const VERSION = 'cordada-v2';
+const VERSION = 'cordada-v3';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'manifest.webmanifest', 'icons/icon.svg',
-  'js/app.js', 'js/store.js', 'js/gear.js', 'js/weather.js', 'js/map.js', 'js/drive.js', 'js/sync.js', 'js/config.js',
+  'js/app.js', 'js/store.js', 'js/gear.js', 'js/weather.js', 'js/map.js', 'js/drive.js', 'js/sync.js', 'js/config.js', 'js/places.js', 'js/auto.js',
   'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css',
   'vendor/leaflet/images/marker-icon.png', 'vendor/leaflet/images/marker-icon-2x.png',
   'vendor/leaflet/images/marker-shadow.png', 'vendor/leaflet/images/layers.png', 'vendor/leaflet/images/layers-2x.png',
