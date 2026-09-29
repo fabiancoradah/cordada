@@ -221,7 +221,45 @@ export async function surroundings(lat, lon) {
     }
   }
   cands.sort((a, b) => a.score - b.score);
-  return { start: cands[0] || null, glacier, huts: huts.slice(0, 5) };
+  // Refugios sin nombre no aportan en la lista.
+  const named = huts.filter((h) => !/^Refugio( \/ abrigo)?$/.test(h.name));
+  return { start: cands[0] || null, cands: cands.slice(0, 12), glacier, huts: named.slice(0, 5) };
+}
+
+// Elevación de varios puntos en una sola consulta.
+async function elevations(pts) {
+  if (!pts.length) return [];
+  const d = await getJSON(`https://api.open-meteo.com/v1/elevation?latitude=${pts.map((p) => p.lat.toFixed(5)).join(',')}&longitude=${pts.map((p) => p.lon.toFixed(5)).join(',')}`);
+  return d.elevation || [];
+}
+
+// Elige el punto de partida que da la subida más corta: se llega en auto lo más
+// alto posible y se camina lo menos posible. Compara las rutas reales de los mejores.
+export async function bestRoute(cands, summit) {
+  if (!cands?.length) return null;
+  const alt = summit.altitude || 0;
+  const eles = await elevations(cands).catch(() => []);
+  const scored = cands.map((c, i) => {
+    const ele = eles[i] ?? null;
+    const km = haversine(c, summit) / 1000;
+    const climb = ele != null && alt ? Math.max(0, alt - ele) : 1500;
+    // Esfuerzo aprox. (Naismith en línea recta con factor de sendero).
+    return { ...c, ele, effort: (km * 1.4) / 4 + climb / 600 };
+  }).sort((a, b) => a.effort - b.effort);
+  // Evita comparar tres estacionamientos pegados entre sí.
+  const picks = [];
+  for (const c of scored) {
+    if (picks.every((p) => haversine(p, c) > 1500)) picks.push(c);
+    if (picks.length === 3) break;
+  }
+  const routes = await Promise.all(picks.map((c) => hikingRoute(c, summit).then((r) => ({ start: c, ...r })).catch(() => null)));
+  const ok = routes.filter((r) => r && r.source === 'brouter'
+    // Descarta rodeos absurdos (más de 3 veces la distancia en línea recta).
+    && r.stats.distKm <= (haversine(r.start, summit) / 1000) * 3 + 2);
+  const best = (ok.length ? ok : routes.filter(Boolean)).sort((a, b) => a.stats.hours - b.stats.hours)[0];
+  if (!best) return null;
+  if (best.pts[0] && best.start.ele != null && best.pts[0].ele == null) best.pts[0].ele = best.start.ele;
+  return best;
 }
 
 // Ruta a pie por senderos de OSM. Si no hay servicio, estima.

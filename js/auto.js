@@ -226,8 +226,9 @@ const toMin = (t) => { const [h, m] = t.slice(11, 16).split(':').map(Number); re
 export function recommend(trip) {
   const alt = trip.altitude || 0;
   const s = trip.gpx?.stats;
-  const startEle = trip.gpx?.pts?.[0]?.ele ?? trip.gpx?.wpts?.[0]?.ele ?? null;
-  const up = s?.up || (startEle != null && alt ? Math.max(0, alt - startEle) : null);
+  const startEle = trip.info?.start?.ele ?? trip.gpx?.wpts?.[0]?.ele ?? trip.gpx?.pts?.[0]?.ele ?? null;
+  // Desnivel neto hasta la cumbre (el acumulado de la ruta puede incluir bajadas).
+  const up = startEle != null && alt ? Math.max(0, alt - startEle) : s?.up ?? null;
   const km = s?.distKm ?? null;
   const upH = s?.hours ?? null; // ida
   const downH = upH != null ? upH * 0.6 : null;
@@ -247,7 +248,7 @@ export function recommend(trip) {
   out.daysOk = planned >= days;
 
   // Campamentos intermedios (subir ~800–1.000 m por día en altura).
-  if (days > 1 && up && startEle != null) {
+  if (days > 1 && up > 300 && startEle != null) {
     const campDays = days - 1;
     const perDay = up / (campDays + 1);
     out.camps = Array.from({ length: campDays }, (_, i) => Math.round((startEle + perDay * (i + 1)) / 100) * 100);
@@ -257,7 +258,7 @@ export function recommend(trip) {
       const hut = huts.filter((h) => !used.has(h) && Math.abs(h.ele - c) < 500 && h.ele < alt).sort((a, b) => Math.abs(a.ele - c) - Math.abs(b.ele - c))[0];
       if (hut) used.add(hut);
       return hut ? { ele: Math.round(hut.ele), name: hut.name } : { ele: c };
-    }).sort((a, b) => a.ele - b.ele);
+    }).filter((c) => c.ele > startEle && c.ele < alt - 150).sort((a, b) => a.ele - b.ele);
   }
 
   // Horarios del día de cumbre según la luz.
@@ -270,7 +271,7 @@ export function recommend(trip) {
   const campUp = out.camps?.length ? Math.max(0, alt - out.camps[out.camps.length - 1].ele) : up;
   // En altura se avanza más lento de lo que dice Naismith.
   const altFactor = alt >= 5000 ? 1.8 : alt >= 4000 ? 1.4 : alt >= 3000 ? 1.15 : 1;
-  const climbH = upH != null ? (days > 1 && up ? upH * (campUp / up) : upH) * altFactor : null;
+  const climbH = upH != null ? (days > 1 && up && out.camps?.length ? upH * Math.min(1, campUp / Math.max(up, 1)) : upH) * altFactor : null;
   const descH = climbH != null ? climbH * 0.6 : null;
   if (climbH != null) {
     const start = alt >= 4000 ? sunrise - 90 : sunrise - 30; // en altura se parte de noche

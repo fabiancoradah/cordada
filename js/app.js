@@ -2,7 +2,7 @@ import { state, save, saveLocal, hooks, uid, longId, normalize, getTrip, newTrip
 import { CATEGORIES, MODULES, SCOPES, gearProgress, weightByMember, ropesOf, ropeKey, ropeOfMember } from './gear.js';
 import { MODELS, fetchWeather, series, hourlyTimes, wmo, assess, externalLinks, lineChart, wireCharts } from './weather.js';
 import { createMap, parseGPX, drawTrack, profileChart, wireProfile, toDMS } from './map.js';
-import { searchPlaces, placeDetails, surroundings, hikingRoute } from './places.js';
+import { searchPlaces, placeDetails, surroundings, bestRoute } from './places.js';
 import { AUTO_MODULES, MANUAL_MODULES, detect, activeModules, syncGear, autoOrganize, recommend } from './auto.js';
 import * as drive from './drive.js';
 import { TripSync } from './sync.js';
@@ -368,19 +368,21 @@ async function enrich(trip, { force = false } = {}) {
           if (!trip.altitude && d.altitude) { trip.altitude = d.altitude; trip.info.altitudeEstimated = !!d.altitudeEstimated; }
         }).catch(() => {}));
       }
-      // v2: búsqueda más completa; reintenta si antes no encontró punto de partida.
+      // v3: compara varios puntos de partida; reintenta si antes no encontró ninguno.
       const retry = !trip.info.start && Date.now() - (trip.info.surroundAt || trip.info.surroundErr || 0) > 10 * 60e3;
-      if (force || trip.info.surroundV !== 2 || retry) {
+      if (force || trip.info.surroundV !== 3 || retry) {
         tasks.push(surroundings(trip.lat, trip.lon).then(async (s) => {
-          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 2, surroundErr: null });
-          if (s.start && (!trip.gpx || trip.gpx.auto)) {
-            const r = await hikingRoute(s.start, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude });
+          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 3, surroundErr: null });
+          const r = (!trip.gpx || trip.gpx.auto) ? await bestRoute(s.cands, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude }) : null;
+          if (r) {
+            s.start = r.start;
+            trip.info.start = { lat: r.start.lat, lon: r.start.lon, name: r.start.name, ele: r.start.ele ?? r.pts[0]?.ele ?? null };
             trip.gpx = {
               name: r.source === 'brouter' ? 'Ruta sugerida por senderos' : 'Ruta estimada (línea recta)',
               auto: true,
               source: r.source,
               pts: r.pts,
-              wpts: [{ lat: s.start.lat, lon: s.start.lon, ele: r.pts[0]?.ele ?? null, name: s.start.name }, { lat: trip.lat, lon: trip.lon, ele: trip.altitude, name: trip.peak }],
+              wpts: [{ lat: s.start.lat, lon: s.start.lon, ele: trip.info.start.ele, name: s.start.name }, { lat: trip.lat, lon: trip.lon, ele: trip.altitude, name: trip.peak }],
               stats: r.stats,
               reachesSummit: r.reachesSummit,
             };
@@ -441,7 +443,9 @@ function tabInfo(trip, el) {
   const going = trip.members.filter((m) => m.rsvp !== 'no');
   const { ids, detected } = activeModules(trip);
   const alerts = trip.weather ? assess(trip.weather, dates) : null;
-  const up = s?.up || (trip.altitude && s?.minEle != null ? trip.altitude - s.minEle : null);
+  const startEle = start?.ele ?? trip.gpx?.pts?.[0]?.ele ?? null;
+  // Desnivel neto (cumbre − partida); el acumulado con subidas y bajadas va aparte.
+  const up = trip.altitude && startEle != null ? Math.max(0, trip.altitude - startEle) : s?.up || null;
 
   el.innerHTML = `
   <section class="hero-card" ${trip.info?.photo ? `style="--photo:url('${esc(trip.info.photo)}')"` : ''}>
@@ -473,12 +477,13 @@ function tabInfo(trip, el) {
     <dl class="stats">
       <div><dt>Cumbre</dt><dd>${trip.altitude ? `${trip.altitude.toLocaleString('es-CL')} m` : '—'}</dd></div>
       <div><dt>Desnivel</dt><dd>${up ? `${Math.round(up).toLocaleString('es-CL')} m` : '…'}</dd></div>
+      ${startEle != null ? `<div><dt>Partida</dt><dd>${Math.round(startEle).toLocaleString('es-CL')} m</dd></div>` : ''}
       <div><dt>Distancia (ida)</dt><dd>${s ? `${s.distKm.toFixed(1)} km` : '…'}</dd></div>
       <div><dt>Tiempo (ida)</dt><dd>${s ? hm(s.hours) : '…'}</dd></div>
       ${d && dates[0] && d.time.includes(dates[0]) ? `<div><dt>Luz del día</dt><dd>${fmtHour(d.sunrise[d.time.indexOf(dates[0])])}–${fmtHour(d.sunset[d.time.indexOf(dates[0])])}</dd></div>` : ''}
     </dl>
     <p class="small muted">${!trip.info?.surroundAt && trip.info?.surroundErr ? 'No se pudo consultar OpenStreetMap en este momento. Se vuelve a intentar solo al abrir la salida.'
-      : !trip.info?.surroundAt || trip.info?.surroundV !== 2 ? 'Buscando punto de partida y calculando la ruta…'
+      : !trip.info?.surroundAt || trip.info?.surroundV !== 3 ? 'Buscando punto de partida y calculando la ruta…'
       : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? `Ruta calculada sobre senderos de OpenStreetMap desde ${esc(start?.name || 'el punto de partida más cercano')}${trip.gpx.reachesSummit === false ? ' (el último tramo a la cumbre, en línea recta)' : ''}. Revísala en el Mapa: puede no ser la ruta normal.` : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
       : trip.gpx ? `Track cargado: ${esc(trip.gpx.name || '')}.` : 'No se encontró un camino cercano: carga el track GPX en el Mapa.'}
       Tiempo según Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos.</p>
