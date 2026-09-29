@@ -148,8 +148,6 @@ function header(title, { back = null, actions = '' } = {}) {
 const ua = navigator.userAgent;
 const isIOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
-// Navegadores dentro de otras apps (Instagram, Facebook) o Chrome/Firefox en iPhone no permiten instalar.
-const iosNotSafari = isIOS && (/CriOS|FxiOS|EdgiOS|FBAN|FBAV|Instagram|Line\//.test(ua) || !/Safari/.test(ua));
 let installEvent = null;
 window.addEventListener('beforeinstallprompt', (e) => {
   e.preventDefault();
@@ -162,30 +160,14 @@ const dismissedInstall = () => {
   try { return Date.now() - Number(localStorage.getItem('cordada.installDismissed') || 0) < 7 * 864e5; } catch { return false; }
 };
 
-const SHARE_ICON = '<svg class="ios-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M8 7l4-4 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 11H5v10h14V11h-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
-// eslint-disable-next-line no-unused-vars
-const ADD_ICON = '<svg class="ios-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 8v8M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
-// En iPhone se recomienda usarla desde Safari: Apple no deja que los links de
-// WhatsApp abran una app instalada desde el navegador, y Safari y la app
-// instalada guardan sus datos por separado.
+// Android: botón para instalar. En iPhone no se muestra nada (se usa desde Safari).
 function installCard() {
-  if (isStandalone() || dismissedInstall()) return '';
-  let title = '📲 Instala Cordada en tu teléfono';
-  let body;
-  if (isIOS) {
-    title = '🧭 En iPhone, usa Cordada desde Safari';
-    body = `${iosNotSafari ? '<p class="alert warn">Estás en otro navegador. Toca el menú <b>···</b> o el ícono de brújula y elige <b>"Abrir en Safari"</b>, para que tus salidas queden siempre en el mismo lugar.</p>' : ''}
-    <p>Los links de invitación de WhatsApp se abren en Safari con todo listo: la salida, tu equipo y el grupo. No hace falta instalar nada.</p>
-    <p class="small">Para volver rápido, guárdala en Favoritos: toca <b>Compartir</b> ${SHARE_ICON} y elige <b>"Agregar a favoritos"</b>.</p>`;
-  } else if (installEvent) {
-    body = '<p>Queda con su ícono, se abre en pantalla completa y funciona sin señal en la montaña.</p><button class="btn primary" id="do-install">Instalar</button>';
-  } else {
-    body = '<p>En el menú del navegador ⋮ elige <b>"Instalar app"</b> o <b>"Agregar a la pantalla principal"</b>.</p>';
-  }
+  if (isIOS || isStandalone() || dismissedInstall() || !installEvent) return '';
   return `<section class="card install-card">
-    <div class="row between"><h3>${title}</h3><button class="icon-btn small" id="dismiss-install" aria-label="Cerrar">×</button></div>
-    ${body}
+    <div class="row between"><h3>📲 Instala Cordada en tu teléfono</h3><button class="icon-btn small" id="dismiss-install" aria-label="Cerrar">×</button></div>
+    <p>Queda con su ícono, se abre en pantalla completa y funciona sin señal en la montaña.</p>
+    <button class="btn primary" id="do-install">Instalar</button>
   </section>`;
 }
 
@@ -200,40 +182,6 @@ function wireInstall() {
   $('#dismiss-install')?.addEventListener('click', () => {
     try { localStorage.setItem('cordada.installDismissed', String(Date.now())); } catch { /* sin almacenamiento */ }
     $$('.install-card').forEach((el) => el.remove());
-  });
-}
-
-// Acepta el link completo de WhatsApp (o solo el código) y abre la invitación.
-function openInviteText(text) {
-  const t = String(text || '').trim();
-  const m = t.match(/#\/(unirse|importar|respuesta)\/([\w-]+)/);
-  if (m) { go(`#/${m[1]}/${m[2]}`); return true; }
-  if (/^[A-Za-z0-9]{20,}$/.test(t)) { go(`#/unirse/${t}`); return true; }
-  return false;
-}
-
-// Solo hace falta en la app instalada en iPhone: ahí los links de WhatsApp abren Safari.
-function openInviteCard() {
-  if (!(isIOS && isStandalone())) return '';
-  return `<section class="card open-invite">
-    <h3>¿Te invitaron a una salida?</h3>
-    <p class="small muted">Pega aquí el link que te llegó por WhatsApp.</p>
-    <form id="invite-form" class="row gap wrap-row">
-      <input id="invite-link" class="grow" inputmode="url" autocomplete="off" placeholder="https://fabiancoradah.github.io/cordada/#/unirse/…">
-      <button class="btn primary" type="submit">Abrir invitación</button>
-    </form>
-  </section>`;
-}
-
-function wireOpenInvite() {
-  $('#invite-form')?.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    let text = $('#invite-link').value;
-    // Si el campo está vacío, intenta leer el portapapeles (el teléfono pide permiso).
-    if (!text.trim() && navigator.clipboard?.readText) {
-      try { text = await navigator.clipboard.readText(); } catch { /* sin permiso */ }
-    }
-    if (!openInviteText(text)) toast('No reconozco ese link. Copia el link completo del mensaje de WhatsApp.');
   });
 }
 
@@ -264,7 +212,6 @@ function renderHome() {
     </section>`}
     ${installCard()}
     <a class="btn primary big" href="#/nueva">＋ Organizar una salida</a>
-    ${openInviteCard()}
     ${upcoming.length ? `<h2 class="section-title">Próximas salidas</h2><div class="grid">${upcoming.map(card).join('')}</div>` : `<section class="card empty">
       <h2>¿Cómo funciona?</h2>
       <ol class="steps">
@@ -277,7 +224,6 @@ function renderHome() {
     ${past.length ? `<h2 class="section-title">Realizadas</h2><div class="grid">${past.map(card).join('')}</div>` : ''}
   </main>`;
   wireInstall();
-  wireOpenInvite();
 }
 
 // ---------- Organizar salida ----------
@@ -709,7 +655,7 @@ async function invite(trip) {
   }
   url ||= `${location.origin}${location.pathname}#/importar/${await encodeTrip(trip)}`;
   const d = trip.date ? fmtDate(trip.date, { weekday: 'long', day: 'numeric', month: 'long' }) : '';
-  const text = `⛰️ ${trip.peak}${trip.altitude ? ` (${trip.altitude.toLocaleString('es-CL')} m)` : ''}${d ? `, ${d}` : ''}.\nConfirma si vas y revisa tu equipo aquí (en iPhone, ábrelo en Safari):`;
+  const text = `⛰️ ${trip.peak}${trip.altitude ? ` (${trip.altitude.toLocaleString('es-CL')} m)` : ''}${d ? `, ${d}` : ''}.\nConfirma si vas y revisa tu equipo aquí:`;
   shareOrCopy({ title: `Salida: ${trip.name}`, text, url, whatsapp: true });
 }
 
