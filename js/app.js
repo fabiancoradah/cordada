@@ -2,7 +2,7 @@ import { state, save, saveLocal, hooks, uid, longId, normalize, getTrip, newTrip
 import { CATEGORIES, MODULES, SCOPES, gearProgress, weightByMember, ropesOf, ropeKey, ropeOfMember } from './gear.js';
 import { MODELS, fetchWeather, series, hourlyTimes, wmo, assess, externalLinks, lineChart, wireCharts } from './weather.js';
 import { createMap, parseGPX, drawTrack, profileChart, wireProfile, toDMS } from './map.js';
-import { searchPlaces, placeDetails, surroundings, bestRoute } from './places.js';
+import { searchPlaces, placeDetails, surroundings, bestRoute, hikingRoute, elevationAt } from './places.js';
 import { AUTO_MODULES, MANUAL_MODULES, detect, activeModules, syncGear, autoOrganize, recommend } from './auto.js';
 import * as drive from './drive.js';
 import { TripSync } from './sync.js';
@@ -370,13 +370,15 @@ async function enrich(trip, { force = false } = {}) {
       }
       // v3: compara varios puntos de partida; reintenta si antes no encontró ninguno.
       const retry = !trip.info.start && Date.now() - (trip.info.surroundAt || trip.info.surroundErr || 0) > 10 * 60e3;
-      if (force || trip.info.surroundV !== 3 || retry) {
+      if (force || trip.info.surroundV !== 4 || retry) {
         tasks.push(surroundings(trip.lat, trip.lon).then(async (s) => {
-          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 3, surroundErr: null });
+          Object.assign(trip.info, { glacier: s.glacier, huts: s.huts.slice(0, 5), start: s.start, surroundAt: Date.now(), surroundV: 4, surroundErr: null });
+          if (trip.info.startManual) { trip.info.start = trip.info.startManual; return; }
           const r = (!trip.gpx || trip.gpx.auto) ? await bestRoute(s.cands, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude }) : null;
           if (r) {
             s.start = r.start;
             trip.info.start = { lat: r.start.lat, lon: r.start.lon, name: r.start.name, ele: r.start.ele ?? r.pts[0]?.ele ?? null };
+            trip.info.startOptions = r.options;
             trip.gpx = {
               name: r.source === 'brouter' ? 'Ruta sugerida por senderos' : 'Ruta estimada (línea recta)',
               auto: true,
@@ -431,6 +433,29 @@ function renderTrip(trip, tab) {
 
 const hm = (h) => `${Math.floor(h)} h ${String(Math.round((h % 1) * 60)).padStart(2, '0')} min`;
 
+// El encargado fija el punto de partida; se recalcula la ruta desde ahí.
+async function setStart(trip, pt) {
+  toast('Calculando la ruta…');
+  const ele = pt.ele ?? await elevationAt(pt.lat, pt.lon).catch(() => null);
+  const start = { lat: +pt.lat.toFixed(6), lon: +pt.lon.toFixed(6), name: pt.name || 'Punto de partida', ele };
+  const r = await hikingRoute(start, { lat: trip.lat, lon: trip.lon, altitude: trip.altitude });
+  trip.info.start = start;
+  trip.info.startManual = start;
+  trip.gpx = {
+    name: r.source === 'brouter' ? 'Ruta por senderos' : 'Ruta estimada (línea recta)',
+    auto: true,
+    source: r.source,
+    pts: r.pts,
+    wpts: [{ ...start }, { lat: trip.lat, lon: trip.lon, ele: trip.altitude, name: trip.peak }],
+    stats: r.stats,
+    reachesSummit: r.reachesSummit,
+  };
+  syncGear(trip);
+  save();
+  if (location.hash.startsWith(`#/salida/${trip.id}/`)) rerenderTab(trip);
+  toast('Punto de partida actualizado');
+}
+
 // --- Salida: toda la información, automática ---
 function tabInfo(trip, el) {
   const owner = isOwner(trip);
@@ -483,7 +508,7 @@ function tabInfo(trip, el) {
       ${d && dates[0] && d.time.includes(dates[0]) ? `<div><dt>Luz del día</dt><dd>${fmtHour(d.sunrise[d.time.indexOf(dates[0])])}–${fmtHour(d.sunset[d.time.indexOf(dates[0])])}</dd></div>` : ''}
     </dl>
     <p class="small muted">${!trip.info?.surroundAt && trip.info?.surroundErr ? 'No se pudo consultar OpenStreetMap en este momento. Se vuelve a intentar solo al abrir la salida.'
-      : !trip.info?.surroundAt || trip.info?.surroundV !== 3 ? 'Buscando punto de partida y calculando la ruta…'
+      : !trip.info?.surroundAt || trip.info?.surroundV !== 4 ? 'Buscando punto de partida y calculando la ruta…'
       : trip.gpx?.auto ? (trip.gpx.source === 'brouter' ? `Ruta calculada sobre senderos de OpenStreetMap desde ${esc(start?.name || 'el punto de partida más cercano')}${trip.gpx.reachesSummit === false ? ' (el último tramo a la cumbre, en línea recta)' : ''}. Revísala en el Mapa: puede no ser la ruta normal.` : 'Distancia y desnivel estimados en línea recta desde el punto de partida más cercano.')
       : trip.gpx ? `Track cargado: ${esc(trip.gpx.name || '')}.` : 'No se encontró un camino cercano: carga el track GPX en el Mapa.'}
       Tiempo según Naismith (4 km/h + 1 h cada 600 m de subida), sin descansos.</p>
@@ -493,6 +518,13 @@ function tabInfo(trip, el) {
       <a class="btn" href="https://www.google.com/search?q=${encodeURIComponent(`wikiloc ${trip.peak}`)}" target="_blank" rel="noopener">🥾 Tracks en Wikiloc</a>
       <a class="btn" href="#/salida/${trip.id}/mapa">🗺️ Ver mapa</a>
     </div>
+    ${start ? `<p class="small top-gap">🚩 Parte desde <b>${esc(start.name)}</b>${start.ele != null ? ` (${Math.round(start.ele).toLocaleString('es-CL')} m)` : ''}${trip.info?.startManual ? ' · elegido por el encargado' : ''}.</p>` : ''}
+    ${owner ? `<details class="top-gap start-picker"><summary>Cambiar punto de partida</summary>
+      ${(trip.info?.startOptions || []).filter((o) => !start || o.lat !== start.lat || o.lon !== start.lon).map((o, i) => `<button class="option" data-start="${i}">
+        <b>${esc(o.name)}</b>${o.ele != null ? ` · ${Math.round(o.ele).toLocaleString('es-CL')} m` : ''}<span class="small muted"> · ${String(o.distKm).replace('.', ',')} km · ${hm(o.hours)} de subida</span></button>`).join('')}
+      <a class="btn small top-gap" href="#/salida/${trip.id}/mapa" id="start-on-map">📍 Elegir en el mapa</a>
+      ${trip.info?.startManual ? '<button class="btn small top-gap" id="start-auto">Volver a automático</button>' : ''}
+    </details>` : ''}
     ${trip.info?.huts?.length ? `<p class="small top-gap">🛖 Refugios cerca: ${trip.info.huts.map((h) => esc(h.name)).join(', ')}</p>` : ''}
     ${owner ? `<form id="ah-form" class="row gap top-gap"><input name="url" type="url" class="grow" placeholder="Pega el link de la ruta en Andeshandbook (opcional)" value="${esc(trip.andesUrl || '')}"><button class="btn small" type="submit">Guardar</button></form>` : ''}
   </section>
@@ -543,6 +575,17 @@ function tabInfo(trip, el) {
   </section>`;
 
   $('#invite', el)?.addEventListener('click', () => invite(trip));
+  const opts = (trip.info?.startOptions || []).filter((o) => !start || o.lat !== start.lat || o.lon !== start.lon);
+  $$('[data-start]', el).forEach((b) => b.addEventListener('click', () => setStart(trip, opts[b.dataset.start])));
+  $('#start-on-map', el)?.addEventListener('click', () => { ui.pickStart = true; });
+  $('#start-auto', el)?.addEventListener('click', () => {
+    delete trip.info.startManual;
+    delete trip.info.surroundV;
+    if (trip.gpx) trip.gpx.auto = true;
+    save();
+    toast('Recalculando…');
+    enrich(trip);
+  });
   wireInstall();
   $('#fit-days', el)?.addEventListener('click', () => {
     const rec = recommend(trip);
@@ -612,7 +655,7 @@ function recoCard(trip, owner) {
   const rows = [
     ['Días sugeridos', `${r.days} ${r.days === 1 ? 'día' : 'días'}${r.daysWhy.length ? ` · ${r.daysWhy.join('; ')}` : ''}`],
     r.camps?.length && ['Campamentos', r.camps.map((c) => (c.name ? `${esc(c.name)} (~${c.ele.toLocaleString('es-CL')} m)` : `~${c.ele.toLocaleString('es-CL')} m`)).join(' → ')],
-    r.start && ['Día de cumbre', `salir ${r.start} · cumbre aprox. ${r.summitEta} · <b>hora límite ${r.turnaround}</b>`],
+    r.start && ['Día de cumbre', `salir ${r.start} · cumbre ${/^\d/.test(r.summitEta) ? `aprox. ${r.summitEta}` : r.summitEta} · <b>hora límite ${r.turnaround}</b>`],
     r.effort && ['Exigencia física', r.effort],
     ['Agua por persona', `${String(r.water).replace('.', ',')} L por día de marcha · ${r.kcal} kcal/día`],
     r.keyGear.length && ['Equipo clave', r.keyGear.join(', ')],
@@ -1033,7 +1076,7 @@ function tabMap(trip, el) {
   <section class="card map-card">
     <div id="map" class="map"></div>
     <div class="row gap wrap-row top-gap">
-      ${isOwner(trip) ? '<button class="btn" id="pick">📍 Corregir cumbre</button>' : ''}
+      ${isOwner(trip) ? '<button class="btn" id="pick-start">🚩 Elegir punto de partida</button><button class="btn" id="pick">📍 Corregir cumbre</button>' : ''}
       <button class="btn" id="locate">🎯 Mi ubicación</button>
       ${isOwner(trip) || !trip.syncId ? '<label class="btn">🗂️ Cargar mi GPX<input type="file" id="gpx-file" accept=".gpx,application/gpx+xml" hidden></label>' : ''}
       ${trip.gpx ? '<button class="btn" id="gpx-dl">⬇️ Descargar GPX</button>' : ''}
@@ -1073,6 +1116,17 @@ function tabMap(trip, el) {
   if (ctrl && trip.gpx) drawTrack(ctrl, trip.gpx);
 
   $('#pick', el)?.addEventListener('click', () => { ctrl?.pickMode(true); toast('Toca el mapa para fijar el objetivo'); });
+  const pickStart = () => {
+    if (!ctrl) return;
+    $('#map', el).classList.add('picking');
+    toast('Toca en el mapa dónde se deja el auto');
+    ctrl.map.once('click', (e) => {
+      $('#map', el).classList.remove('picking');
+      setStart(trip, { lat: e.latlng.lat, lon: e.latlng.lng, name: 'Punto de partida' }).then(() => tabMap(trip, el));
+    });
+  };
+  $('#pick-start', el)?.addEventListener('click', pickStart);
+  if (ui.pickStart) { ui.pickStart = false; setTimeout(pickStart, 300); }
   $('#locate', el).addEventListener('click', () => {
     if (!navigator.geolocation) return toast('Tu navegador no entrega ubicación');
     navigator.geolocation.getCurrentPosition((pos) => {

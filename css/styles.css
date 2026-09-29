@@ -358,3 +358,5 @@ label.check { display: flex; align-items: center; gap: 8px; color: var(--text); 
 
 /* Instalar (Android) */
 .install-card { border-color: color-mix(in srgb, var(--series-1) 45%, var(--border)); background: color-mix(in srgb, var(--series-1) 6%, var(--surface)); }
+.start-picker summary { cursor: pointer; color: var(--info); font-size: .9rem; }
+.start-picker .option { display: block; width: 100%; text-align: left; margin-top: 8px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font: inherit; cursor: pointer; }

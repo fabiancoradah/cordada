@@ -250,15 +250,24 @@ export async function bestRoute(cands, summit) {
   const picks = [];
   for (const c of scored) {
     if (picks.every((p) => haversine(p, c) > 1500)) picks.push(c);
-    if (picks.length === 3) break;
+    if (picks.length === 4) break;
   }
-  const routes = await Promise.all(picks.map((c) => hikingRoute(c, summit).then((r) => ({ start: c, ...r })).catch(() => null)));
+  // De a una: el servidor público de rutas rechaza consultas simultáneas.
+  const routes = [];
+  for (const c of picks) {
+    routes.push(await hikingRoute(c, summit).then((r) => ({ start: c, ...r })).catch(() => null));
+  }
   const ok = routes.filter((r) => r && r.source === 'brouter'
     // Descarta rodeos absurdos (más de 3 veces la distancia en línea recta).
     && r.stats.distKm <= (haversine(r.start, summit) / 1000) * 3 + 2);
   const best = (ok.length ? ok : routes.filter(Boolean)).sort((a, b) => a.stats.hours - b.stats.hours)[0];
   if (!best) return null;
   if (best.pts[0] && best.start.ele != null && best.pts[0].ele == null) best.pts[0].ele = best.start.ele;
+  // Alternativas evaluadas, para que el encargado pueda elegir otra.
+  best.options = routes.filter(Boolean).map((r) => ({
+    lat: r.start.lat, lon: r.start.lon, name: r.start.name, ele: r.start.ele ?? r.pts[0]?.ele ?? null,
+    distKm: +r.stats.distKm.toFixed(1), hours: +r.stats.hours.toFixed(2), source: r.source,
+  }));
   return best;
 }
 

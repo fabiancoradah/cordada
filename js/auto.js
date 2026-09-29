@@ -280,7 +280,8 @@ export function recommend(trip) {
     const byLight = sunset - descH * 60 - 60;
     const cap = alt >= 3500 ? 14 * 60 : 15 * 60;
     out.turnaround = hhmm(Math.min(byLight, cap));
-    out.summitEta = hhmm(Math.max(3 * 60, start) + climbH * 60 * 1.25); // +25 % por descansos
+    const eta = Math.max(3 * 60, start) + climbH * 60 * 1.25; // +25 % por descansos
+    out.summitEta = eta < 22 * 60 ? hhmm(eta) : 'no alcanza en el día';
     out.late = Math.max(3 * 60, start) + climbH * 60 * 1.25 > Math.min(byLight, cap);
   }
 
