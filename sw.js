@@ -1,5 +1,5 @@
 // Service worker: la app funciona sin señal en la montaña.
-const VERSION = 'cordada-v5';
+const VERSION = 'cordada-v6';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'manifest.webmanifest', 'icons/icon.svg',
   'js/app.js', 'js/store.js', 'js/gear.js', 'js/weather.js', 'js/map.js', 'js/drive.js', 'js/sync.js', 'js/config.js', 'js/places.js', 'js/auto.js',

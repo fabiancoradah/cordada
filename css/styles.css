@@ -355,3 +355,9 @@ label.check { display: flex; align-items: center; gap: 8px; color: var(--text); 
 .reco dt { color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
 .reco dd { margin: 0; }
 .alert .btn.small { margin-left: 6px; }
+
+/* Instalar / abrir invitación */
+.install-card { border-color: color-mix(in srgb, var(--series-1) 45%, var(--border)); background: color-mix(in srgb, var(--series-1) 6%, var(--surface)); }
+.ios-steps { margin: 6px 0 0; padding-left: 1.2rem; display: grid; gap: 8px; }
+.ios-icon { width: 20px; height: 20px; vertical-align: -4px; color: var(--info); }
+.open-invite input { min-width: 0; }
