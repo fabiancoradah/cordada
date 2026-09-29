@@ -163,26 +163,28 @@ const dismissedInstall = () => {
 };
 
 const SHARE_ICON = '<svg class="ios-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M8 7l4-4 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 11H5v10h14V11h-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+// eslint-disable-next-line no-unused-vars
 const ADD_ICON = '<svg class="ios-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 8v8M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
 
+// En iPhone se recomienda usarla desde Safari: Apple no deja que los links de
+// WhatsApp abran una app instalada desde el navegador, y Safari y la app
+// instalada guardan sus datos por separado.
 function installCard() {
   if (isStandalone() || dismissedInstall()) return '';
+  let title = '📲 Instala Cordada en tu teléfono';
   let body;
-  if (isIOS && iosNotSafari) {
-    body = `<p>Para instalarla en tu iPhone, abre este link en <b>Safari</b>: toca el menú <b>···</b> o el ícono de brújula y elige <b>"Abrir en Safari"</b>.</p>`;
-  } else if (isIOS) {
-    body = `<ol class="ios-steps">
-      <li>Toca <b>Compartir</b> ${SHARE_ICON} en la barra de Safari (abajo o arriba).</li>
-      <li>Baja y elige <b>"Agregar a inicio"</b> ${ADD_ICON} y luego <b>Agregar</b>.</li>
-      <li>Abre <b>Cordada</b> desde tu pantalla de inicio.</li>
-    </ol>`;
+  if (isIOS) {
+    title = '🧭 En iPhone, usa Cordada desde Safari';
+    body = `${iosNotSafari ? '<p class="alert warn">Estás en otro navegador. Toca el menú <b>···</b> o el ícono de brújula y elige <b>"Abrir en Safari"</b>, para que tus salidas queden siempre en el mismo lugar.</p>' : ''}
+    <p>Los links de invitación de WhatsApp se abren en Safari con todo listo: la salida, tu equipo y el grupo. No hace falta instalar nada.</p>
+    <p class="small">Para volver rápido, guárdala en Favoritos: toca <b>Compartir</b> ${SHARE_ICON} y elige <b>"Agregar a favoritos"</b>.</p>`;
   } else if (installEvent) {
     body = '<p>Queda con su ícono, se abre en pantalla completa y funciona sin señal en la montaña.</p><button class="btn primary" id="do-install">Instalar</button>';
   } else {
     body = '<p>En el menú del navegador ⋮ elige <b>"Instalar app"</b> o <b>"Agregar a la pantalla principal"</b>.</p>';
   }
   return `<section class="card install-card">
-    <div class="row between"><h3>📲 Instala Cordada en tu teléfono</h3><button class="icon-btn small" id="dismiss-install" aria-label="Cerrar">×</button></div>
+    <div class="row between"><h3>${title}</h3><button class="icon-btn small" id="dismiss-install" aria-label="Cerrar">×</button></div>
     ${body}
   </section>`;
 }
